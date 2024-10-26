@@ -66,42 +66,26 @@ where
         let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
 
         trace!(?request_id, "Replica: PreAccept");
-
-        // TODO(performance): Remove the lock here
-        // Creates contention on the event store
-        if let Some(ballot) = self
-            .node
-            .event_store
-            .accept_tx_ballot(&t0, Ballot::default())
-        {
-            if ballot != Ballot::default() {
-                return Ok(PreAcceptResponse {
-                    nack: true,
-                    ..Default::default()
-                });
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ballot) = event_store.accept_tx_ballot(&t0, Ballot::default()) {
+                if ballot != Ballot::default() {
+                    return Ok(PreAcceptResponse {
+                        nack: true,
+                        ..Default::default()
+                    });
+                }
             }
-        }
 
-        // let waiting_time = self.network.get_waiting_time(node_serial).await;
+            let (t, deps) = event_store.pre_accept_tx(request_id, t0, request.event)?;
 
-        // let (sx, rx) = oneshot::channel();
-
-        let (t, deps) = self
-            .node
-            .event_store
-            .pre_accept_tx(request_id, t0, request.event)?;
-
-        // self.reorder_buffer
-        //      .send_msg(t0, sx, request.event, waiting_time)
-        //      .await?;
-
-        // let (t, deps) = rx.await?;
-
-        Ok(PreAcceptResponse {
-            timestamp: t.into(),
-            dependencies: into_dependency(&deps),
-            nack: false,
+            Ok(PreAcceptResponse {
+                timestamp: t.into(),
+                dependencies: into_dependency(&deps),
+                nack: false,
+            })
         })
+        .await?
     }
 
     #[instrument(level = "trace", skip(self, request))]
@@ -116,12 +100,9 @@ where
 
         trace!(?request_id, "Replica: Accept");
 
-        let dependencies = {
-            if let Some(ballot) = self
-                .node
-                .event_store
-                .accept_tx_ballot(&t_zero, request_ballot)
-            {
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ballot) = event_store.accept_tx_ballot(&t_zero, request_ballot) {
                 if ballot != request_ballot {
                     return Ok(AcceptResponse {
                         dependencies: Vec::new(),
@@ -130,7 +111,7 @@ where
                 }
             }
 
-            self.node.event_store.upsert_tx(UpsertEvent {
+            event_store.upsert_tx(UpsertEvent {
                 id: request_id,
                 t_zero,
                 t,
@@ -140,14 +121,12 @@ where
                 ballot: Some(request_ballot),
                 hashes: None,
             })?;
-
-            self.node.event_store.get_tx_dependencies(&t, &t_zero)
-        };
-
-        Ok(AcceptResponse {
-            dependencies: into_dependency(&dependencies),
-            nack: false,
+            Ok(AcceptResponse {
+                dependencies: into_dependency(&event_store.get_tx_dependencies(&t, &t_zero)),
+                nack: false,
+            })
         })
+        .await?
     }
 
     #[instrument(level = "trace", skip(self, request))]
@@ -228,53 +207,46 @@ where
         // TODO/WARNING: This was initially in one Mutex lock
         //let mut event_store = self.node.event_store.lock().await;
 
-        if let Some(state) = self.node.event_store.get_event_state(&t_zero) {
-            // If another coordinator has started recovery with a higher ballot
-            // Return NACK with the higher ballot number
-            let request_ballot = Ballot::try_from(request.ballot.as_slice())?;
-            if let Some(ballot) = self
-                .node
-                .event_store
-                .accept_tx_ballot(&t_zero, request_ballot)
-            {
-                if request_ballot != ballot {
-                    return Ok(RecoverResponse {
-                        nack: ballot.into(),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            if matches!(state, State::Undefined) {
-                self.node
-                    .event_store
-                    .pre_accept_tx(request_id, t_zero, request.event)?;
-            };
-        } else {
-            self.node
-                .event_store
-                .pre_accept_tx(request_id, t_zero, request.event)?;
-        }
-        let recover_deps = self.node.event_store.get_recover_deps(&t_zero)?;
-
+        let event_store = self.node.event_store.clone();
         self.node
             .stats
             .total_recovers
             .fetch_add(1, Ordering::Relaxed);
+        tokio::task::spawn_blocking(move || {
+            if let Some(state) = event_store.get_event_state(&t_zero) {
+                // If another coordinator has started recovery with a higher ballot
+                // Return NACK with the higher ballot number
+                let request_ballot = Ballot::try_from(request.ballot.as_slice())?;
+                if let Some(ballot) = event_store.accept_tx_ballot(&t_zero, request_ballot) {
+                    if request_ballot != ballot {
+                        return Ok(RecoverResponse {
+                            nack: ballot.into(),
+                            ..Default::default()
+                        });
+                    }
+                }
 
-        let local_state = self
-            .node
-            .event_store
-            .get_event_state(&t_zero)
-            .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?;
-        Ok(RecoverResponse {
-            local_state: local_state.into(),
-            wait: into_dependency(&recover_deps.wait),
-            superseding: recover_deps.superseding,
-            dependencies: into_dependency(&recover_deps.dependencies),
-            timestamp: recover_deps.timestamp.into(),
-            nack: Ballot::default().into(),
+                if matches!(state, State::Undefined) {
+                    event_store.pre_accept_tx(request_id, t_zero, request.event)?;
+                };
+            } else {
+                event_store.pre_accept_tx(request_id, t_zero, request.event)?;
+            }
+            let recover_deps = event_store.get_recover_deps(&t_zero)?;
+
+            let local_state = event_store
+                .get_event_state(&t_zero)
+                .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?;
+            Ok(RecoverResponse {
+                local_state: local_state.into(),
+                wait: into_dependency(&recover_deps.wait),
+                superseding: recover_deps.superseding,
+                dependencies: into_dependency(&recover_deps.dependencies),
+                timestamp: recover_deps.timestamp.into(),
+                nack: Ballot::default().into(),
+            })
         })
+        .await?
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -296,7 +268,8 @@ where
         }
 
         // This ensures that this t0 will not get a fast path in the future
-        self.node.event_store.inc_time_with_guard(t0)?;
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || event_store.inc_time_with_guard(t0)).await??;
         Ok(TryRecoveryResponse { accepted: false })
     }
 }
