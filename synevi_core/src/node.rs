@@ -17,7 +17,7 @@ use synevi_types::types::{
 };
 use synevi_types::{Executor, State, SyneviError, Transaction, T};
 use tokio::task::JoinSet;
-use tracing::instrument;
+use tracing::{error, instrument};
 use ulid::Ulid;
 
 #[derive(Debug, Default)]
@@ -216,9 +216,9 @@ where
             return Err(SyneviError::NotReady);
         };
         let _permit = self.semaphore.acquire().await?;
-        let mut coordinator =
-            Coordinator::new(self.clone(), TransactionPayload::External(transaction), id).await;
-        let tx_result = coordinator.run().await?;
+        let tx_result = Coordinator::new(self.clone())
+            .pre_accept(id, TransactionPayload::External(transaction))
+            .await?;
 
         match tx_result {
             ExecutorResult::External(e) => Ok(e),
@@ -237,8 +237,9 @@ where
             return Err(SyneviError::NotReady);
         };
         let _permit = self.semaphore.acquire().await?;
-        let mut coordinator = Coordinator::new(self.clone(), transaction, id).await;
-        let result = coordinator.run().await;
+        let result = Coordinator::new(self.clone())
+            .pre_accept(id, transaction)
+            .await;
 
         result
     }
@@ -258,13 +259,17 @@ where
     }
 
     #[instrument(level = "trace", skip(self))]
-    pub async fn commit(&self, event: UpsertEvent) -> Result<(), SyneviError> {
+    pub(crate) async fn commit(&self, event: UpsertEvent) -> Result<(), SyneviError> {
         let t0_commit = event.t_zero.clone();
         let t_commit = event.t.clone();
-
-        let prev_event = self.event_store.get_event(t0_commit)?;
-
-        self.event_store.upsert_tx(event.clone())?;
+        let event_store = self.event_store.clone();
+        let event_clone = event.clone();
+        let prev_event = tokio::task::spawn_blocking(move || {
+            let prev_event = event_store.get_event(t0_commit)?;
+            event_store.upsert_tx(event_clone)?;
+            Ok::<_, SyneviError>(prev_event)
+        })
+        .await??;
         self.wait_handler.notify_commit(&t0_commit, &t_commit);
         if !prev_event.is_some_and(|e| e.state > State::Committed || e.dependencies.is_empty()) {
             if let Some(waiter) = self.wait_handler.get_waiter(&event) {
@@ -279,14 +284,17 @@ where
     }
 
     #[instrument(level = "trace", skip(self))]
-    pub async fn apply(
+    pub(crate) async fn apply(
         &self,
         mut event: UpsertEvent,
         request_hashes: Option<Hashes>,
-    ) -> Result<(Option<InternalSyneviResult<E>>, Hashes), SyneviError> {
+    ) -> Result<(InternalSyneviResult<E>, Hashes), SyneviError> {
         let t0_apply = event.t_zero.clone();
+        let event_store = self.event_store.clone();
 
-        let needs_wait = if let Some(prev_event) = self.event_store.get_event(t0_apply)? {
+        let needs_wait = if let Some(prev_event) =
+            tokio::task::spawn_blocking(move || event_store.get_event(t0_apply)).await??
+        {
             prev_event.state < State::Applied
         } else {
             let mut commit_event = event.clone();
@@ -309,20 +317,16 @@ where
         }
 
         // - Check transaction hash -> SyneviError::MismatchingTransactionHash
-        let mut node_hashes = self
-            .event_store
-            .get_or_update_transaction_hash(event.clone())?;
+        let event_store = self.event_store.clone();
+        let event_clone = event.clone();
+        let mut node_hashes = tokio::task::spawn_blocking(move || {
+            event_store.get_or_update_transaction_hash(event_clone)
+        })
+        .await??;
 
         if let Some(hashes) = &request_hashes {
             if hashes.transaction_hash != node_hashes.transaction_hash {
-                println!(
-                    "MismatchedTransactionHashes @ Node: {}
-request: {:?}
-got:     {:?}",
-                    self.get_serial(),
-                    hashes.transaction_hash,
-                    node_hashes.transaction_hash
-                );
+                error!(?hashes, ?node_hashes, "Mismatched hashes");
                 return Err(SyneviError::MismatchedTransactionHashes);
             }
         }
@@ -336,22 +340,28 @@ got:     {:?}",
         )?;
         let result = self.execute(transaction).await;
 
-        // - Check execution hash -> SyneviError::MismatchingExecutionHash
-        let mut hasher = Sha3_256::new();
-        postcard::to_io(&result, &mut hasher)?;
-        let execution_hash: [u8; 32] = hasher.finalize().into();
-        if let Some(hashes) = request_hashes {
-            if hashes.execution_hash != execution_hash {
-                return Err(SyneviError::MismatchedExecutionHashes);
-            }
-        }
-        node_hashes.execution_hash = execution_hash;
-        event.hashes = Some(node_hashes.clone());
+        let event_store = self.event_store.clone();
 
-        // - Upsert
-        self.event_store.upsert_tx(event)?;
+        let (result, node_hashes) = tokio::task::spawn_blocking(move || {
+            // - Check execution hash -> SyneviError::MismatchingExecutionHash
+            let mut hasher = Sha3_256::new();
+            postcard::to_io(&result, &mut hasher)?;
+            let execution_hash: [u8; 32] = hasher.finalize().into();
+            if let Some(hashes) = request_hashes {
+                if hashes.execution_hash != execution_hash {
+                    return Err(SyneviError::MismatchedExecutionHashes);
+                }
+            }
+            node_hashes.execution_hash = execution_hash;
+            event.hashes = Some(node_hashes.clone());
+
+            // - Upsert
+            event_store.upsert_tx(event)?;
+            Ok((result, node_hashes))
+        })
+        .await??;
         self.wait_handler.notify_apply(&t0_apply);
-        Ok((Some(result), node_hashes))
+        Ok((result, node_hashes))
     }
 
     async fn execute(
@@ -577,13 +587,12 @@ mod tests {
             transaction: Vec<u8>,
         ) -> Result<(), SyneviError> {
             let _permit = self.semaphore.acquire().await?;
-            let mut coordinator = Coordinator::new(
-                self.clone(),
-                synevi_types::types::TransactionPayload::External(transaction),
-                id,
-            )
-            .await;
-            coordinator.failing_pre_accept().await?;
+            Coordinator::new(self.clone())
+                .failing_pre_accept(
+                    id,
+                    synevi_types::types::TransactionPayload::External(transaction),
+                )
+                .await?;
             Ok(())
         }
     }
