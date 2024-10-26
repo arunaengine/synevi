@@ -23,7 +23,7 @@ mod tests {
         let mut nodes: Vec<Arc<Node<GrpcNetwork, DummyExecutor, LmdbStore>>> = vec![];
 
         for (i, m) in node_names.iter().enumerate() {
-            let test_path = format!("dev/shm/{m}");
+            let test_path = format!("/dev/shm/{m}");
             fs::create_dir(&test_path).await.unwrap();
             dbg!(&test_path);
             let store = LmdbStore::new(test_path, i as u16).unwrap();
