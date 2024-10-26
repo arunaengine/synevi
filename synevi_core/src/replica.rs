@@ -362,7 +362,6 @@ where
                 sdx.send(response).await.unwrap();
             }
         });
-        println!("Returning streaming receiver");
         // Stream all events to member
         Ok(rcv)
     }

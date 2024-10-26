@@ -321,12 +321,6 @@ impl InternalStore {
             }
 
             if event.state == State::Applied {
-                if self.last_applied > event.t {
-                    println!(
-                        "Node: {} | {:?} > {:?} | Deps: {:?}",
-                        self.node_serial, self.last_applied, event.t, event.dependencies
-                    );
-                }
                 assert!(self.last_applied < event.t);
                 self.last_applied = event.t;
                 let hashes = upsert_event

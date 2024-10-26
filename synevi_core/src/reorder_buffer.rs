@@ -7,6 +7,7 @@ use std::{
 use synevi_network::network::Network;
 use synevi_types::{traits::Store, Executor, SyneviError, T, T0};
 use tokio::{sync::oneshot, time::timeout};
+use tracing::error;
 
 use crate::{node::Node, utils::into_dependency};
 
@@ -85,7 +86,6 @@ where
                     event,
                     latency,
                 })) => {
-                    //println!("Received message: {:?} latency: {}", t0, latency);
                     let now = Instant::now();
                     buffer.insert(t0, (notify, event, id));
                     if current_transaction.1 == T0::default() {
@@ -112,7 +112,7 @@ where
                     next_latency = latency;
                 }
                 Ok(Err(e)) => {
-                    println!("Error receiving message {e}")
+                    error!("Error receiving message {e}")
                 }
                 Err(_) => {
                     // Elapsed more than 1.2x average (TODO) latency

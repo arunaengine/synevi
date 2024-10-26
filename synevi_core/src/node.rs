@@ -17,7 +17,7 @@ use synevi_types::types::{
 };
 use synevi_types::{Executor, State, SyneviError, Transaction, T};
 use tokio::task::JoinSet;
-use tracing::{error, instrument};
+use tracing::{error, instrument, trace};
 use ulid::Ulid;
 
 #[derive(Debug, Default)]
@@ -429,7 +429,7 @@ where
             match self.wait_handler.check_recovery() {
                 CheckResult::NoRecovery => (),
                 CheckResult::RecoverEvent(recover_event) => {
-                    println!(
+                    trace!(
                         "{}, Recovering event: {:?}",
                         self.get_serial(),
                         recover_event
@@ -445,7 +445,7 @@ where
                     });
                 }
                 CheckResult::RecoverUnknown(t0_recover) => {
-                    println!(
+                    trace!(
                         "{}, Recovering unknown: {:?}",
                         self.get_serial(),
                         t0_recover
@@ -454,7 +454,7 @@ where
                     match interface.broadcast_recovery(t0_recover).await {
                         Ok(true) => (),
                         Ok(false) => {
-                            println!("Unknown recovery failed");
+                            error!("Unknown recovery failed");
                             self.wait_handler.notify_apply(&t0_recover);
                         }
                         Err(err) => {
@@ -474,12 +474,8 @@ where
         replica: ReplicaConfig<N, E, S>,
         member_host: String,
     ) -> Result<(), SyneviError> {
-        // 1. Broadcast self_config to other member
-        println!("{} Before join", self.get_serial());
         let expected = self.network.join_electorate(member_host.clone()).await?;
         // 2. wait for JoinElectorate responses with expected majority and config from others
-
-        println!("{} Waiting for responded", self.get_serial());
         while self
             .network
             .get_node_status()
@@ -489,17 +485,12 @@ where
         {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
-
-        println!("{} Sync events", self.get_serial());
         let (last_applied, _) = self.event_store.last_applied();
         self.sync_events(last_applied, &replica).await?;
 
         // 3. Send ReadyJoinElectorate && set myself to ready
         self.set_ready();
-        println!("{}, Before electorate", self.get_serial());
         self.network.ready_electorate(member_host).await?;
-
-        println!("{}, Ready electorate finished", self.get_serial());
 
         Ok(())
     }
@@ -529,7 +520,6 @@ where
                                 transaction_hash: event.transaction_hash,
                             })
                             .await?;
-                        //println!("{response}");
                         Ok::<(), SyneviError>(())
                     });
                 }
@@ -545,7 +535,6 @@ where
                                 dependencies: event.dependencies,
                             })
                             .await?;
-                        //println!("{response}");
                         Ok::<(), SyneviError>(())
                     });
                 }

@@ -371,13 +371,6 @@ impl InternalData {
 
                 let last_t = self.last_applied;
 
-                // if last_t > event.t {
-                //     println!(
-                //         "Node: {:?}, store: {:?}",
-                //         self.node_serial,
-                //         self.get_event_store()
-                //     );
-                // }
                 // Safeguard
                 assert!(last_t < event.t);
 
@@ -435,15 +428,6 @@ impl InternalData {
                 if last_t > event.t {
                     println!("last_t: {:?}, event.t: {:?}", last_t, event.t);
                 }
-                //     println!(
-                //         "Node: {:?}, last_t: {:?}, event_t: {:?}, store: {:?}",
-                //         self.node_serial,
-                //         last_t,
-                //         event.t,
-                //         self.get_event_store()
-                //     );
-                // }
-                // Safeguard
                 assert!(last_t < event.t);
 
                 self.last_applied = event.t;
@@ -644,61 +628,5 @@ impl InternalData {
         let event = db.get(&read_txn, &t_zero.get_inner())?;
         read_txn.commit()?;
         Ok(event)
-    }
-
-    // fn get_and_update_hash(
-    //     &self,
-    //     t_zero: T0,
-    //     execution_hash: [u8; 32],
-    // ) -> Result<Hashes, SyneviError> {
-    //     let t_zero = t_zero.get_inner();
-    //     let mut write_txn = self.db.write_txn()?;
-    //     let db: EventDb = self
-    //         .db
-    //         .open_database(&write_txn, Some(EVENT_DB_NAME))?
-    //         .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-    //     let Some(mut event) = db.get(&write_txn, &t_zero)? else {
-    //         return Err(SyneviError::EventNotFound(t_zero));
-    //     };
-    //     let Some(mut hashes) = event.hashes else {
-    //         return Err(SyneviError::MissingTransactionHash);
-    //     };
-    //     hashes.execution_hash = execution_hash;
-    //     event.hashes = Some(hashes.clone());
-
-    //     db.put(&mut write_txn, &t_zero, &event)?;
-    //     write_txn.commit()?;
-    //     Ok(hashes)
-    // }
-
-    // fn last_applied_hash(&self) -> Result<(T, [u8; 32]), SyneviError> {
-    //     let last = self.last_applied;
-    //     let last_t0 = self
-    //         .mappings
-    //         .get(&last)
-    //         .ok_or_else(|| SyneviError::EventNotFound(last.get_inner()))?;
-    //     let read_txn = self.db.read_txn()?;
-    //     let db: EventDb = self
-    //         .db
-    //         .open_database(&read_txn, Some(EVENT_DB_NAME))?
-    //         .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-    //     let event = db
-    //         .get(&read_txn, &last_t0.get_inner())?
-    //         .ok_or_else(|| SyneviError::EventNotFound(last_t0.get_inner()))?
-    //         .hashes
-    //         .ok_or_else(|| SyneviError::MissingExecutionHash)?;
-    //     Ok((last, event.execution_hash))
-    // }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_db() {
-        // TODO
-        //let db = Database::new("../../tests/database".to_string()).unwrap();
-        //db.init(Bytes::from("key"), Bytes::from("value"))
-        //    .unwrap()
     }
 }

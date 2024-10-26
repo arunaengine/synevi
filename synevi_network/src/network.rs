@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tonic::transport::{Channel, Server};
+use tracing::error;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -559,12 +560,10 @@ impl NetworkInterface for GrpcNetworkSet {
                     }
                     Ok(Err(e)) => {
                         tracing::error!("Error in response: {:?}", e);
-                        println!("Error in response: {:?}", e);
                         continue;
                     }
                     Err(_) => {
                         tracing::error!("Join error");
-                        println!("Join error");
                         continue;
                     }
                 };
@@ -581,7 +580,6 @@ impl NetworkInterface for GrpcNetworkSet {
                             result.push(res);
                         }
                         _ => {
-                            println!("Recover: Join error");
                             tracing::error!("Recover: Join error");
                             continue;
                         }
@@ -592,12 +590,10 @@ impl NetworkInterface for GrpcNetworkSet {
                     while let Some(r) = &responses.join_next().await {
                         match r {
                             Ok(Err(e)) => {
-                                println!("Apply: Error in response: {:?}", e);
                                 tracing::error!("Apply: Error in response: {:?}", e);
                                 continue;
                             }
                             Err(_) => {
-                                println!("Apply: Join error");
                                 tracing::error!("Apply: Join error");
                                 continue;
                             }
@@ -612,8 +608,8 @@ impl NetworkInterface for GrpcNetworkSet {
         }
 
         if result.len() < majority && !self.members.is_empty() {
-            println!("Majority not reached: {:?}/{}", result, majority);
-            println!("Members: {:?}", &self.members);
+            error!("Majority not reached: {:?}/{}", result, majority);
+            error!("Members: {:?}", &self.members);
             return Err(SyneviError::MajorityNotReached);
         }
         Ok(result)
