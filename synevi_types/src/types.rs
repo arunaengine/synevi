@@ -105,7 +105,7 @@ impl Transaction for InternalExecution {
                 bytes.push(0);
                 bytes.extend_from_slice(&id.to_bytes());
                 bytes.extend_from_slice(&serial.to_be_bytes());
-                bytes.extend_from_slice(&new_node_host.as_bytes());
+                bytes.extend_from_slice(new_node_host.as_bytes());
             }
             InternalExecution::ReadyElectorate { id, serial } => {
                 bytes.push(1);

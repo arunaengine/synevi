@@ -585,7 +585,7 @@ impl InternalData {
     }
 
     fn last_applied(&self) -> (T, T0) {
-        let t = self.last_applied.clone();
+        let t = self.last_applied;
         let t0 = self.mappings.get(&t).cloned().unwrap_or(T0::default());
         (t, t0)
     }

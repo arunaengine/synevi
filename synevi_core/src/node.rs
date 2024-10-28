@@ -116,7 +116,7 @@ where
         Ok(node)
     }
 
-    pub fn set_ready(&self) -> () {
+    pub fn set_ready(&self) {
         self.network
             .get_node_status()
             .info
@@ -237,11 +237,10 @@ where
             return Err(SyneviError::NotReady);
         };
         let _permit = self.semaphore.acquire().await?;
-        let result = Coordinator::new(self.clone())
-            .pre_accept(id, transaction)
-            .await;
 
-        result
+        Coordinator::new(self.clone())
+            .pre_accept(id, transaction)
+            .await
     }
 
     pub fn get_stats(&self) -> (u64, u64, u64) {
@@ -260,8 +259,8 @@ where
 
     #[instrument(level = "trace", skip(self))]
     pub(crate) async fn commit(&self, event: UpsertEvent) -> Result<(), SyneviError> {
-        let t0_commit = event.t_zero.clone();
-        let t_commit = event.t.clone();
+        let t0_commit = event.t_zero;
+        let t_commit = event.t;
         let event_store = self.event_store.clone();
         let event_clone = event.clone();
         let prev_event = tokio::task::spawn_blocking(move || {
@@ -275,7 +274,7 @@ where
             if let Some(waiter) = self.wait_handler.get_waiter(&event) {
                 waiter.await.map_err(|e| {
                     tracing::error!("Error waiting for commit: {:?}", e);
-                    SyneviError::ReceiveError(format!("Error waiting for commit"))
+                    SyneviError::ReceiveError("Error waiting for commit".to_string())
                 })?
             };
         }
@@ -289,7 +288,7 @@ where
         mut event: UpsertEvent,
         request_hashes: Option<Hashes>,
     ) -> Result<(InternalSyneviResult<E>, Hashes), SyneviError> {
-        let t0_apply = event.t_zero.clone();
+        let t0_apply = event.t_zero;
         let event_store = self.event_store.clone();
 
         let needs_wait = if let Some(prev_event) =
@@ -311,7 +310,7 @@ where
             if let Some(waiter) = self.wait_handler.get_waiter(&event) {
                 waiter.await.map_err(|e| {
                     tracing::error!("Error waiting for commit: {:?}", e);
-                    SyneviError::ReceiveError(format!("Error waiting for commit"))
+                    SyneviError::ReceiveError("Error waiting for commit".to_string())
                 })?;
             }
         }
@@ -369,15 +368,14 @@ where
         transaction: TransactionPayload<<E as Executor>::Tx>,
     ) -> Result<ExecutorResult<<E as Executor>::Tx>, SyneviError> {
         // TODO: Refactor in execute function
-        let result = match transaction {
-            TransactionPayload::None => {
-                return Err(SyneviError::TransactionNotFound);
-            }
+
+        match transaction {
+            TransactionPayload::None => Err(SyneviError::TransactionNotFound),
             TransactionPayload::External(tx) => self
                 .executor
                 .execute(tx)
                 .await
-                .map(|e| ExecutorResult::<<E as Executor>::Tx>::External(e)),
+                .map(ExecutorResult::<<E as Executor>::Tx>::External),
             TransactionPayload::Internal(request) => {
                 // TODO: Build special execution
                 let result = match &request {
@@ -409,8 +407,7 @@ where
                     Err(err) => Ok(ExecutorResult::Internal(Err(err))),
                 }
             }
-        };
-        result
+        }
     }
 
     async fn run_check_recovery(&self) {
@@ -752,7 +749,7 @@ mod tests {
             0,
             synevi_network::network::GrpcNetwork::new(
                 SocketAddr::from_str("0.0.0.0:1337").unwrap(),
-                format!("http://localhost:1337"),
+                "http://localhost:1337".to_string(),
                 id,
                 0,
             ),

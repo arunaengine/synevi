@@ -119,16 +119,14 @@ where
     pub fn notify_commit(&self, t0_commit: &T0, t_commit: &T) {
         let mut waiter_lock = self.waiters.lock().expect("Locking waiters failed");
         waiter_lock.retain(|_, waiter| {
-            if waiter.dependencies.contains(t0_commit) {
-                if t_commit > &waiter.t {
-                    waiter.dependencies.remove(t0_commit);
-                    waiter.waited_since = Instant::now();
-                    if waiter.dependencies.is_empty() {
-                        for sdx in waiter.sender.drain(..) {
-                            let _ = sdx.send(());
-                        }
-                        return false;
+            if waiter.dependencies.contains(t0_commit) && t_commit > &waiter.t {
+                waiter.dependencies.remove(t0_commit);
+                waiter.waited_since = Instant::now();
+                if waiter.dependencies.is_empty() {
+                    for sdx in waiter.sender.drain(..) {
+                        let _ = sdx.send(());
                     }
+                    return false;
                 }
             }
             true

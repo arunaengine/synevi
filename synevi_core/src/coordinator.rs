@@ -78,7 +78,7 @@ where
                 id,
                 state: State::PreAccepted,
                 transaction,
-                t_zero: t_zero,
+                t_zero,
                 t: T(*t_zero),
                 dependencies: HashSet::default(),
                 ballot: Ballot::default(),
@@ -304,6 +304,7 @@ where
     }
 
     #[instrument(level = "trace", skip(self))]
+    #[allow(clippy::type_complexity)]
     async fn execute_consensus(
         &self,
         mut state_machine: TransactionStateMachine<E::Tx>,
@@ -546,7 +547,7 @@ pub mod tests {
                     id,
                     state: State::PreAccepted,
                     transaction,
-                    t_zero: t_zero,
+                    t_zero,
                     t: T(*t_zero),
                     dependencies: HashSet::default(),
                     ballot: Ballot::default(),
