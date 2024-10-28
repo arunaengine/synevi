@@ -255,7 +255,24 @@ impl Network for GrpcNetwork {
         host: String,
         ready: bool,
     ) -> Result<(), SyneviError> {
-        let channel = Channel::from_shared(host.clone())?.connect().await?;
+        let endpoint = Channel::from_shared(host.clone())?;
+        // Retry connecting to member
+        let mut backoff = 0u64;
+        let channel = loop {
+            match endpoint.connect().await {
+                Ok(channel) => break channel,
+                Err(e) => {
+                    if backoff < 5 {
+                        backoff += 1;
+                    } else {
+                        tracing::error!("Backoff limit reached, connecting to member");
+                        return Err(SyneviError::TonicTransportError(e));
+                    }
+                    tracing::error!("Error connecting to member: {:?}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                }
+            }
+        };
         let mut writer = self.members.write().await;
         if writer.get(&id).is_none() {
             writer.insert(
