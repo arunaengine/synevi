@@ -12,7 +12,7 @@ use synevi_network::replica::Replica;
 use synevi_persistence::mem_store::MemStore;
 use synevi_types::traits::Store;
 use synevi_types::types::{
-    ExecutorResult, Hashes, InternalExecution, InternalSyneviResult, SyneviResult,
+    Event, ExecutorResult, Hashes, InternalExecution, InternalSyneviResult, SyneviResult,
     TransactionPayload, UpsertEvent,
 };
 use synevi_types::{Executor, State, SyneviError, Transaction, T};
@@ -208,6 +208,11 @@ where
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self))]
+    pub fn get_event_by_id(&self, id: u128) -> Option<Event> {
+        self.event_store.get_event_by_id(id).ok().flatten()
+    }
+
     #[instrument(level = "trace", skip(self, transaction))]
     pub async fn transaction(self: Arc<Self>, id: u128, transaction: E::Tx) -> SyneviResult<E> {
         if !self.has_members() {
@@ -337,7 +342,7 @@ where
                 .clone()
                 .ok_or_else(|| SyneviError::TransactionNotFound)?,
         )?;
-        let result = self.execute(transaction).await;
+        let result = self.execute(event.id, transaction).await;
 
         let event_store = self.event_store.clone();
 
@@ -365,6 +370,7 @@ where
 
     async fn execute(
         &self,
+        id: u128,
         transaction: TransactionPayload<<E as Executor>::Tx>,
     ) -> Result<ExecutorResult<<E as Executor>::Tx>, SyneviError> {
         // TODO: Refactor in execute function
@@ -373,7 +379,7 @@ where
             TransactionPayload::None => Err(SyneviError::TransactionNotFound),
             TransactionPayload::External(tx) => self
                 .executor
-                .execute(tx)
+                .execute(id, tx)
                 .await
                 .map(ExecutorResult::<<E as Executor>::Tx>::External),
             TransactionPayload::Internal(request) => {

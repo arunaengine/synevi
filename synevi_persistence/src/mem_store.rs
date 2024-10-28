@@ -1,6 +1,6 @@
 use ahash::RandomState;
 use monotime::MonoTime;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use synevi_types::error::SyneviError;
@@ -14,10 +14,11 @@ use tracing::instrument;
 
 #[derive(Debug, Clone)]
 struct InternalStore {
-    pub events: BTreeMap<T0, Event>,      // Key: t0, value: Event
-    pub(crate) mappings: BTreeMap<T, T0>, // Key: t, value t0
-    pub last_applied: T,                  // t of last applied entry
-    pub(crate) latest_time: MonoTime,     // last created or recognized time
+    pub(crate) id_map: HashMap<u128, T0, RandomState>, // Key: id, value: t0
+    pub events: BTreeMap<T0, Event>,                   // Key: t0, value: Event
+    pub(crate) mappings: BTreeMap<T, T0>,              // Key: t, value t0
+    pub last_applied: T,                               // t of last applied entry
+    pub(crate) latest_time: MonoTime,                  // last created or recognized time
     pub node_serial: u16,
     latest_hash: [u8; 32],
 }
@@ -31,6 +32,7 @@ impl MemStore {
     #[instrument(level = "trace")]
     pub fn new(node_serial: u16) -> Result<Self, SyneviError> {
         let store = Arc::new(Mutex::new(InternalStore {
+            id_map: HashMap::default(),
             events: BTreeMap::default(),
             mappings: BTreeMap::default(),
             last_applied: T::default(),
@@ -149,6 +151,15 @@ impl Store for MemStore {
             .cloned())
     }
 
+    fn get_event_by_id(&self, id: u128) -> Result<Option<Event>, SyneviError> {
+        let store = self.store.lock().expect("poisoned lock, aborting");
+        Ok(store
+            .id_map
+            .get(&id)
+            .and_then(|t0| store.events.get(t0))
+            .cloned())
+    }
+
     fn inc_time_with_guard(&self, guard: T0) -> Result<(), SyneviError> {
         let mut lock = self.store.lock().expect("poisoned lock, aborting");
         lock.latest_time = lock
@@ -258,6 +269,10 @@ impl InternalStore {
 
         let Some(event) = self.events.get_mut(&upsert_event.t_zero) else {
             let mut event = Event::from(upsert_event.clone());
+
+            // Not an update -> Add id mapping
+            self.id_map.insert(event.id, event.t_zero);
+
             if matches!(event.state, State::Applied) {
                 self.mappings.insert(event.t, event.t_zero);
                 if let Some(deps) = upsert_event.dependencies {

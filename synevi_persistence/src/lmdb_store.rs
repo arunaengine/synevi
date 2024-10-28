@@ -19,6 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use tracing::instrument;
 
 const EVENT_DB_NAME: &str = "events";
+const ID_MAPPINGS_DB_NAME: &str = "id_mappings";
 type EventDb = Database<U128<BigEndian>, SerdeBincode<Event>>;
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,8 @@ pub struct LmdbStore {
 #[derive(Clone, Debug)]
 struct InternalData {
     db: Env,
+    events: EventDb,
+    id_mappings: Database<U128<BigEndian>, U128<BigEndian>>,
     pub(crate) mappings: BTreeMap<T, T0>, // Key: t, value t0
     pub last_applied: T,                  // t of last applied entry
     pub(crate) latest_time: MonoTime,     // last created or recognized t0
@@ -48,6 +51,8 @@ impl LmdbStore {
         let env_clone = env.clone();
         let mut write_txn = env.write_txn()?;
         let events_db: Option<EventDb> = env.open_database(&write_txn, Some(EVENT_DB_NAME))?;
+        let id_mappings: Database<_, _> =
+            env.create_database(&mut write_txn, Some(ID_MAPPINGS_DB_NAME))?;
         match events_db {
             Some(db) => {
                 let result = db
@@ -84,6 +89,8 @@ impl LmdbStore {
                     //db: env_clone,
                     data: Arc::new(Mutex::new(InternalData {
                         db: env_clone,
+                        events: db,
+                        id_mappings,
                         mappings,
                         last_applied,
                         latest_time,
@@ -93,11 +100,13 @@ impl LmdbStore {
                 })
             }
             None => {
-                let _: EventDb = env.create_database(&mut write_txn, Some(EVENT_DB_NAME))?;
+                let events: EventDb = env.create_database(&mut write_txn, Some(EVENT_DB_NAME))?;
                 write_txn.commit()?;
                 Ok(LmdbStore {
                     data: Arc::new(Mutex::new(InternalData {
                         db: env_clone,
+                        events,
+                        id_mappings,
                         mappings: BTreeMap::default(),
                         last_applied: T::default(),
                         latest_time: MonoTime::default(),
@@ -241,6 +250,15 @@ impl Store for LmdbStore {
         event.state = State::Applied;
         Ok(event.hash_event(lock.latest_hash))
     }
+
+    fn get_event_by_id(&self, id: u128) -> Result<Option<Event>, SyneviError> {
+        let lock = self.data.lock().expect("poisoned lock, aborting");
+        let read_txn = lock.db.read_txn()?;
+        let Some(mapping) = lock.id_mappings.get(&read_txn, &id)? else {
+            return Ok(None);
+        };
+        lock.events.get(&read_txn, &mapping).map_err(Into::into)
+    }
 }
 
 impl InternalData {
@@ -317,15 +335,11 @@ impl InternalData {
     #[instrument(level = "trace")]
     fn accept_tx_ballot(&self, t_zero: &T0, ballot: Ballot) -> Option<Ballot> {
         let mut write_txn = self.db.write_txn().ok()?;
-        let events_db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))
-            .ok()??;
-        let mut event = events_db.get(&write_txn, &t_zero.get_inner()).ok()??;
+        let mut event = self.events.get(&write_txn, &t_zero.get_inner()).ok()??;
 
         if event.ballot < ballot {
             event.ballot = ballot;
-            let _ = events_db.put(&mut write_txn, &t_zero.get_inner(), &event);
+            let _ = self.events.put(&mut write_txn, &t_zero.get_inner(), &event);
         }
         write_txn.commit().ok()?;
         //self.db.force_sync().ok()?;
@@ -343,14 +357,19 @@ impl InternalData {
         }
 
         let mut write_txn = self.db.write_txn()?;
-        let events_db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
+        let events_db: EventDb = self.events;
+
         let event = events_db.get(&write_txn, &upsert_event.t_zero.get_inner())?;
 
         let Some(mut event) = event else {
             let mut event = Event::from(upsert_event.clone());
+
+            // Not an update -> Add events id mapping
+            self.id_mappings.put(
+                &mut write_txn,
+                &upsert_event.id,
+                &upsert_event.t_zero.get_inner(),
+            )?;
 
             if matches!(event.state, State::Applied) {
                 self.mappings.insert(event.t, event.t_zero);
@@ -449,11 +468,8 @@ impl InternalData {
     #[instrument(level = "trace")]
     fn get_recover_deps(&self, t_zero: &T0) -> Result<RecoverDependencies, SyneviError> {
         let read_txn = self.db.read_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let timestamp = db
+        let timestamp = self
+            .events
             .get(&read_txn, &t_zero.get_inner())?
             .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?
             .t;
@@ -463,7 +479,8 @@ impl InternalData {
         };
 
         for (t_dep, t_zero_dep) in self.mappings.range(self.last_applied..) {
-            let dep_event = db
+            let dep_event = self
+                .events
                 .get(&read_txn, &t_zero_dep.get_inner())?
                 .ok_or_else(|| SyneviError::DependencyNotFound(t_zero_dep.get_inner()))?;
             match dep_event.state {
@@ -508,11 +525,8 @@ impl InternalData {
 
     fn get_event_state(&self, t_zero: &T0) -> Option<State> {
         let read_txn = self.db.read_txn().ok()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))
-            .ok()??;
-        let state = db
+        let state = self
+            .events
             .get(&read_txn, &t_zero.get_inner())
             .ok()?
             .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))
@@ -535,15 +549,12 @@ impl InternalData {
         }
 
         let mut write_txn = self.db.write_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let event = db.get(&write_txn, &t_zero_recover.get_inner())?;
+        let event = self.events.get(&write_txn, &t_zero_recover.get_inner())?;
 
         if let Some(mut event) = event {
             event.ballot = Ballot(event.ballot.next_with_node(node_serial).into_time());
-            db.put(&mut write_txn, &t_zero_recover.get_inner(), &event)?;
+            self.events
+                .put(&mut write_txn, &t_zero_recover.get_inner(), &event)?;
             write_txn.commit()?;
 
             Ok(Some(RecoverEvent {
@@ -563,13 +574,8 @@ impl InternalData {
     fn get_event_store(&self) -> BTreeMap<T0, Event> {
         // TODO: Remove unwrap and change trait result
         let read_txn = self.db.read_txn().unwrap();
-        let events_db: Database<U128<BigEndian>, SerdeBincode<Event>> = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))
-            .unwrap()
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))
-            .unwrap();
-        let result = events_db
+        let result = self
+            .events
             .iter(&read_txn)
             .unwrap()
             .filter_map(|e| {
@@ -601,13 +607,11 @@ impl InternalData {
             None if last_applied == T::default() => T0::default(),
             _ => return Err(SyneviError::EventNotFound(last_applied.get_inner())),
         };
+
+        let events_db = self.events;
         tokio::task::spawn_blocking(move || {
             let read_txn = db.read_txn()?;
             let range = last_applied_t0.get_inner()..;
-            let events_db: EventDb = db
-                .open_database(&read_txn, Some(EVENT_DB_NAME))?
-                .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-
             for result in events_db.range(&read_txn, &range)? {
                 let (_t0, event) = result?;
                 sdx.blocking_send(Ok(event))
@@ -621,11 +625,7 @@ impl InternalData {
 
     fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
         let read_txn = self.db.read_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let event = db.get(&read_txn, &t_zero.get_inner())?;
+        let event = self.events.get(&read_txn, &t_zero.get_inner())?;
         read_txn.commit()?;
         Ok(event)
     }

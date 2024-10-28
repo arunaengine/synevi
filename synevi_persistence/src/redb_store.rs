@@ -15,6 +15,7 @@ use tokio::sync::mpsc::Receiver;
 use tracing::instrument;
 
 const TABLE: TableDefinition<u128, &[u8]> = TableDefinition::new("events");
+const ID_MAPPINGS_DB: TableDefinition<u128, u128> = TableDefinition::new("id_mappings");
 
 #[derive(Clone, Debug)]
 pub struct RedbStore {
@@ -37,6 +38,7 @@ impl RedbStore {
         {
             let write_txn = db.begin_write().unwrap();
             let _ = write_txn.open_table(TABLE).unwrap();
+            let _ = write_txn.open_table(ID_MAPPINGS_DB).unwrap();
             write_txn.commit().unwrap();
         }
         let read_txn = db.begin_read().unwrap();
@@ -209,6 +211,14 @@ impl Store for RedbStore {
             .get_event(t_zero)
     }
 
+    #[instrument(level = "trace", skip(self))]
+    fn get_event_by_id(&self, t_zero: u128) -> Result<Option<Event>, SyneviError> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .get_event_by_id(t_zero)
+    }
+
     fn inc_time_with_guard(&self, guard: T0) -> Result<(), SyneviError> {
         let mut lock = self.data.lock().expect("poisoned lock, aborting");
         lock.latest_time = lock
@@ -345,6 +355,12 @@ impl InternalData {
 
         let Some(mut event) = event else {
             let mut event = Event::from(upsert_event.clone());
+
+            // Not an update -> Insert mapping
+            {
+                let mut table = write_txn.open_table(ID_MAPPINGS_DB).ok().unwrap();
+                let _ = table.insert(&upsert_event.id, &upsert_event.t_zero.get_inner());
+            }
 
             if matches!(event.state, State::Applied) {
                 self.mappings.insert(event.t, event.t_zero);
@@ -637,59 +653,24 @@ impl InternalData {
         Ok(event)
     }
 
-    // fn get_and_update_hash(
-    //     &self,
-    //     t_zero: T0,
-    //     execution_hash: [u8; 32],
-    // ) -> Result<Hashes, SyneviError> {
-    //     let t_zero = t_zero.get_inner();
-    //     let mut write_txn = self.db.write_txn()?;
-    //     let db: EventDb = self
-    //         .db
-    //         .open_database(&write_txn, Some(EVENT_DB_NAME))?
-    //         .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-    //     let Some(mut event) = db.get(&write_txn, &t_zero)? else {
-    //         return Err(SyneviError::EventNotFound(t_zero));
-    //     };
-    //     let Some(mut hashes) = event.hashes else {
-    //         return Err(SyneviError::MissingTransactionHash);
-    //     };
-    //     hashes.execution_hash = execution_hash;
-    //     event.hashes = Some(hashes.clone());
+    fn get_event_by_id(&self, t_zero: u128) -> Result<Option<Event>, SyneviError> {
+        let read_txn = self.db.begin_read().ok().unwrap();
+        let event = {
+            let mapping_table = read_txn.open_table(ID_MAPPINGS_DB).ok().unwrap();
+            let t_zero = mapping_table
+                .get(&t_zero)
+                .ok()
+                .unwrap()
+                .map(|e| e.value())
+                .ok_or_else(|| SyneviError::EventNotFound(t_zero))?;
 
-    //     db.put(&mut write_txn, &t_zero, &event)?;
-    //     write_txn.commit()?;
-    //     Ok(hashes)
-    // }
-
-    // fn last_applied_hash(&self) -> Result<(T, [u8; 32]), SyneviError> {
-    //     let last = self.last_applied;
-    //     let last_t0 = self
-    //         .mappings
-    //         .get(&last)
-    //         .ok_or_else(|| SyneviError::EventNotFound(last.get_inner()))?;
-    //     let read_txn = self.db.read_txn()?;
-    //     let db: EventDb = self
-    //         .db
-    //         .open_database(&read_txn, Some(EVENT_DB_NAME))?
-    //         .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-    //     let event = db
-    //         .get(&read_txn, &last_t0.get_inner())?
-    //         .ok_or_else(|| SyneviError::EventNotFound(last_t0.get_inner()))?
-    //         .hashes
-    //         .ok_or_else(|| SyneviError::MissingExecutionHash)?;
-    //     Ok((last, event.execution_hash))
-    // }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_db() {
-        // TODO
-        //let db = Database::new("../../tests/database".to_string()).unwrap();
-        //db.init(Bytes::from("key"), Bytes::from("value"))
-        //    .unwrap()
+            let table = read_txn.open_table(TABLE).ok().unwrap();
+            table
+                .get(&t_zero)
+                .ok()
+                .unwrap()
+                .map(|e| bincode::deserialize::<Event>(e.value()).ok().unwrap())
+        };
+        Ok(event)
     }
 }

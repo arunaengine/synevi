@@ -58,7 +58,7 @@ impl synevi_types::Transaction for Transaction {
 #[async_trait::async_trait]
 impl Executor for KVExecutor {
     type Tx = Transaction;
-    async fn execute(&self, transaction: Self::Tx) -> SyneviResult<Self> {
+    async fn execute(&self, _id: u128, transaction: Self::Tx) -> SyneviResult<Self> {
         Ok(match transaction {
             Transaction::Read { key } => {
                 let Some(key) = self.store.lock().unwrap().get(&key).cloned() else {

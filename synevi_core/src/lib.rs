@@ -124,7 +124,7 @@ pub mod tests {
     impl Executor for DummyExecutor {
         type Tx = Vec<u8>;
 
-        async fn execute(&self, data: Vec<u8>) -> SyneviResult<Self> {
+        async fn execute(&self, _id: u128, data: Vec<u8>) -> SyneviResult<Self> {
             Ok(Ok(data))
         }
     }

@@ -36,7 +36,7 @@ impl Transaction for Vec<u8> {
 pub trait Executor: Send + Sync + 'static {
     type Tx: Transaction + Serialize;
     // Executor expects a type with interior mutability
-    async fn execute(&self, transaction: Self::Tx) -> SyneviResult<Self>;
+    async fn execute(&self, id: u128, transaction: Self::Tx) -> SyneviResult<Self>;
 }
 
 #[async_trait::async_trait]
@@ -45,8 +45,8 @@ where
     E: Executor,
 {
     type Tx = E::Tx;
-    async fn execute(&self, transaction: Self::Tx) -> SyneviResult<Self> {
-        self.as_ref().execute(transaction).await
+    async fn execute(&self, id: u128, transaction: Self::Tx) -> SyneviResult<Self> {
+        self.as_ref().execute(id, transaction).await
     }
 }
 
@@ -57,11 +57,11 @@ where
 {
     type Tx = E::Tx;
 
-    async fn execute(&self, transaction: Self::Tx) -> SyneviResult<Self> {
+    async fn execute(&self, id: u128, transaction: Self::Tx) -> SyneviResult<Self> {
         self.upgrade()
             .ok_or_else(|| SyneviError::ArcDropped)?
             .as_ref()
-            .execute(transaction)
+            .execute(id, transaction)
             .await
     }
 }
@@ -102,6 +102,7 @@ pub trait Store: Send + Sync + Sized + 'static {
     //    fn last_applied_hash(&self) -> Result<(T, [u8; 32]), SyneviError>;
 
     fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError>;
+    fn get_event_by_id(&self, id: u128) -> Result<Option<Event>, SyneviError>;
     fn get_events_after(
         &self,
         last_applied: T,
