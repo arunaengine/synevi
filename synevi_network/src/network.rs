@@ -255,6 +255,9 @@ impl Network for GrpcNetwork {
         host: String,
         ready: bool,
     ) -> Result<(), SyneviError> {
+        if self.self_status.info.id == id {
+            return Ok(());
+        }
         let endpoint = Channel::from_shared(host.clone())?;
         // Retry connecting to member
         let mut backoff = 0u64;
