@@ -2,48 +2,57 @@ use ahash::RandomState;
 use heed::{
     byteorder::BigEndian,
     types::{SerdeBincode, U128},
-    Database, Env, EnvOpenOptions,
+    Database, Env, EnvFlags, EnvOpenOptions,
 };
 use monotime::MonoTime;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex},
+};
 use synevi_types::{
     error::SyneviError,
     traits::Store,
     types::{Event, Hashes, RecoverDependencies, RecoverEvent, UpsertEvent},
     Ballot, State, T, T0,
 };
-use tokio::sync::{mpsc::Receiver, Mutex};
+use tokio::sync::mpsc::Receiver;
 use tracing::instrument;
 
 const EVENT_DB_NAME: &str = "events";
+const ID_MAPPINGS_DB_NAME: &str = "id_mappings";
 type EventDb = Database<U128<BigEndian>, SerdeBincode<Event>>;
 
-#[derive(Debug)]
-pub struct PersistentStore {
-    data: Mutex<MutableData>,
+#[derive(Clone, Debug)]
+pub struct LmdbStore {
+    data: Arc<Mutex<InternalData>>,
 }
 
 #[derive(Clone, Debug)]
-struct MutableData {
+struct InternalData {
     db: Env,
+    events: EventDb,
+    id_mappings: Database<U128<BigEndian>, U128<BigEndian>>,
     pub(crate) mappings: BTreeMap<T, T0>, // Key: t, value t0
     pub last_applied: T,                  // t of last applied entry
-    pub(crate) latest_t0: T0,             // last created or recognized t0
+    pub(crate) latest_time: MonoTime,     // last created or recognized t0
     pub node_serial: u16,
     latest_hash: [u8; 32],
 }
 
-impl PersistentStore {
-    pub fn new(path: String, node_serial: u16) -> Result<PersistentStore, SyneviError> {
+impl LmdbStore {
+    pub fn new(path: String, node_serial: u16) -> Result<LmdbStore, SyneviError> {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(1024 * 1024 * 1024)
                 .max_dbs(16)
+                .flags(EnvFlags::MAP_ASYNC | EnvFlags::WRITE_MAP)
                 .open(path)?
         };
         let env_clone = env.clone();
         let mut write_txn = env.write_txn()?;
         let events_db: Option<EventDb> = env.open_database(&write_txn, Some(EVENT_DB_NAME))?;
+        let id_mappings: Database<_, _> =
+            env.create_database(&mut write_txn, Some(ID_MAPPINGS_DB_NAME))?;
         match events_db {
             Some(db) => {
                 let result = db
@@ -59,7 +68,7 @@ impl PersistentStore {
 
                 let mut mappings = BTreeMap::default();
                 let mut last_applied = T::default();
-                let mut latest_t0 = T0::default();
+                let mut latest_time = MonoTime::default();
                 let mut latest_hash: [u8; 32] = [0; 32];
                 for event in result {
                     mappings.insert(event.t, event.t_zero);
@@ -71,50 +80,56 @@ impl PersistentStore {
                             return Err(SyneviError::MissingTransactionHash);
                         };
                     }
-                    if event.t_zero > latest_t0 {
-                        latest_t0 = event.t_zero;
+                    if *event.t > latest_time {
+                        latest_time = *event.t;
                     }
                 }
                 write_txn.commit()?;
-                Ok(PersistentStore {
+                Ok(LmdbStore {
                     //db: env_clone,
-                    data: Mutex::new(MutableData {
+                    data: Arc::new(Mutex::new(InternalData {
                         db: env_clone,
+                        events: db,
+                        id_mappings,
                         mappings,
                         last_applied,
-                        latest_t0,
+                        latest_time,
                         node_serial,
                         latest_hash,
-                    }),
+                    })),
                 })
             }
             None => {
-                let _: EventDb = env.create_database(&mut write_txn, Some(EVENT_DB_NAME))?;
+                let events: EventDb = env.create_database(&mut write_txn, Some(EVENT_DB_NAME))?;
                 write_txn.commit()?;
-                Ok(PersistentStore {
-                    data: Mutex::new(MutableData {
+                Ok(LmdbStore {
+                    data: Arc::new(Mutex::new(InternalData {
                         db: env_clone,
+                        events,
+                        id_mappings,
                         mappings: BTreeMap::default(),
                         last_applied: T::default(),
-                        latest_t0: T0::default(),
+                        latest_time: MonoTime::default(),
                         node_serial,
                         latest_hash: [0; 32],
-                    }),
+                    })),
                 })
             }
         }
     }
 }
 
-#[async_trait::async_trait]
-impl Store for PersistentStore {
+impl Store for LmdbStore {
     #[instrument(level = "trace")]
-    async fn init_t_zero(&self, node_serial: u16) -> T0 {
-        self.data.lock().await.init_t_zero(node_serial).await
+    fn init_t_zero(&self, node_serial: u16) -> T0 {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .init_t_zero(node_serial)
     }
 
     #[instrument(level = "trace")]
-    async fn pre_accept_tx(
+    fn pre_accept_tx(
         &self,
         id: u128,
         t_zero: T0,
@@ -122,127 +137,158 @@ impl Store for PersistentStore {
     ) -> Result<(T, HashSet<T0, RandomState>), SyneviError> {
         self.data
             .lock()
-            .await
+            .expect("poisoned lock, aborting")
             .pre_accept_tx(id, t_zero, transaction)
-            .await
     }
 
     #[instrument(level = "trace")]
-    async fn get_tx_dependencies(&self, t: &T, t_zero: &T0) -> HashSet<T0, RandomState> {
-        self.data.lock().await.get_tx_dependencies(t, t_zero).await
-    }
-
-    #[instrument(level = "trace")]
-    async fn accept_tx_ballot(&self, t_zero: &T0, ballot: Ballot) -> Option<Ballot> {
+    fn get_tx_dependencies(&self, t: &T, t_zero: &T0) -> HashSet<T0, RandomState> {
         self.data
             .lock()
-            .await
+            .expect("poisoned lock, aborting")
+            .get_tx_dependencies(t, t_zero)
+    }
+
+    #[instrument(level = "trace")]
+    fn accept_tx_ballot(&self, t_zero: &T0, ballot: Ballot) -> Option<Ballot> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
             .accept_tx_ballot(t_zero, ballot)
-            .await
     }
 
     #[instrument(level = "trace", skip(self))]
-    async fn upsert_tx(&self, upsert_event: UpsertEvent) -> Result<(), SyneviError> {
-        self.data.lock().await.upsert_tx(upsert_event).await
+    fn upsert_tx(&self, upsert_event: UpsertEvent) -> Result<(), SyneviError> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .upsert_tx(upsert_event)
     }
 
     #[instrument(level = "trace")]
-    async fn get_recover_deps(&self, t_zero: &T0) -> Result<RecoverDependencies, SyneviError> {
-        self.data.lock().await.get_recover_deps(t_zero).await
+    fn get_recover_deps(&self, t_zero: &T0) -> Result<RecoverDependencies, SyneviError> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .get_recover_deps(t_zero)
     }
 
     #[instrument(level = "trace")]
-    async fn get_event_state(&self, t_zero: &T0) -> Option<State> {
-        self.data.lock().await.get_event_state(t_zero).await
+    fn get_event_state(&self, t_zero: &T0) -> Option<State> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .get_event_state(t_zero)
     }
 
     #[instrument(level = "trace")]
-    async fn recover_event(
+    fn recover_event(
         &self,
         t_zero_recover: &T0,
         node_serial: u16,
-    ) -> Result<RecoverEvent, SyneviError> {
+    ) -> Result<Option<RecoverEvent>, SyneviError> {
         self.data
             .lock()
-            .await
+            .expect("poisoned lock, aborting")
             .recover_event(t_zero_recover, node_serial)
-            .await
     }
 
     #[instrument(level = "trace")]
-    async fn get_event_store(&self) -> BTreeMap<T0, Event> {
-        self.data.lock().await.get_event_store().await
+    fn get_event_store(&self) -> BTreeMap<T0, Event> {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .get_event_store()
     }
 
     #[instrument(level = "trace")]
-    async fn last_applied(&self) -> (T, T0) {
-        self.data.lock().await.last_applied().await
+    fn last_applied(&self) -> (T, T0) {
+        self.data
+            .lock()
+            .expect("poisoned lock, aborting")
+            .last_applied()
     }
 
     #[instrument(level = "trace")]
-    async fn get_events_after(
+    fn get_events_after(
         &self,
         last_applied: T,
-        self_event: u128,
     ) -> Result<Receiver<Result<Event, SyneviError>>, SyneviError> {
         self.data
             .lock()
-            .await
-            .get_events_after(last_applied, self_event)
-            .await
+            .expect("poisoned lock, aborting")
+            .get_events_after(last_applied)
     }
 
     #[instrument(level = "trace", skip(self))]
-    async fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
-        self.data.lock().await.get_event(t_zero).await
-    }
-
-    async fn get_and_update_hash(
-        &self,
-        t_zero: T0,
-        execution_hash: [u8; 32],
-    ) -> Result<Hashes, SyneviError> {
+    fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
         self.data
             .lock()
-            .await
-            .get_and_update_hash(t_zero, execution_hash)
-            .await
+            .expect("poisoned lock, aborting")
+            .get_event(t_zero)
     }
 
-    #[instrument(level = "trace", skip(self))]
-    async fn last_applied_hash(&self) -> Result<(T, [u8; 32]), SyneviError> {
-        self.data.lock().await.last_applied_hash().await
+    fn inc_time_with_guard(&self, guard: T0) -> Result<(), SyneviError> {
+        let mut lock = self.data.lock().expect("poisoned lock, aborting");
+        lock.latest_time = lock
+            .latest_time
+            .next_with_guard_and_node(&guard, lock.node_serial)
+            .into_time();
+        Ok(())
+    }
+
+    fn get_or_update_transaction_hash(&self, event: UpsertEvent) -> Result<Hashes, SyneviError> {
+        let lock = self.data.lock().expect("poisoned lock, aborting");
+        if let Some(event) = lock.get_event(event.t_zero)? {
+            if event.state == State::Applied {
+                if let Some(hashes) = event.hashes {
+                    return Ok(hashes);
+                }
+            }
+        }
+        let mut event = Event::from(event);
+        event.state = State::Applied;
+        Ok(event.hash_event(lock.latest_hash))
+    }
+
+    fn get_event_by_id(&self, id: u128) -> Result<Option<Event>, SyneviError> {
+        let lock = self.data.lock().expect("poisoned lock, aborting");
+        let read_txn = lock.db.read_txn()?;
+        let Some(mapping) = lock.id_mappings.get(&read_txn, &id)? else {
+            return Ok(None);
+        };
+        lock.events.get(&read_txn, &mapping).map_err(Into::into)
     }
 }
-impl MutableData {
+
+impl InternalData {
     #[instrument(level = "trace")]
-    async fn init_t_zero(&mut self, node_serial: u16) -> T0 {
-        let t0 = T0(self.latest_t0.next_with_node(node_serial).into_time());
-        self.latest_t0 = t0;
-        t0
+    fn init_t_zero(&mut self, node_serial: u16) -> T0 {
+        let next_time = self.latest_time.next_with_node(node_serial).into_time();
+        self.latest_time = next_time;
+        T0(next_time)
     }
 
     #[instrument(level = "trace")]
-    async fn pre_accept_tx(
+    fn pre_accept_tx(
         &mut self,
         id: u128,
         t_zero: T0,
         transaction: Vec<u8>,
     ) -> Result<(T, HashSet<T0, RandomState>), SyneviError> {
         let (t, deps) = {
-            let t = T(if let Some((last_t, _)) = self.mappings.last_key_value() {
-                if **last_t > *t_zero {
-                    t_zero
-                        .next_with_guard_and_node(last_t, self.node_serial)
-                        .into_time()
-                } else {
-                    *t_zero
-                }
+            let t = if self.latest_time > *t_zero {
+                let new_time_t = t_zero
+                    .next_with_guard_and_node(&self.latest_time, self.node_serial)
+                    .into_time();
+
+                self.latest_time = new_time_t;
+                T(new_time_t)
             } else {
-                // No entries in the map -> insert the new event
-                *t_zero
-            });
-            let deps = self.get_tx_dependencies(&t, &t_zero).await;
+                T(*t_zero)
+            };
+            // This might not be necessary to re-use the write lock here
+            let deps = self.get_tx_dependencies(&t, &t_zero);
             (t, deps)
         };
 
@@ -255,12 +301,13 @@ impl MutableData {
             dependencies: Some(deps.clone()),
             ..Default::default()
         };
-        self.upsert_tx(event).await?;
+        self.upsert_tx(event)?;
+        //self.db.force_sync()?;
         Ok((t, deps))
     }
 
     #[instrument(level = "trace")]
-    async fn get_tx_dependencies(&self, t: &T, t_zero: &T0) -> HashSet<T0, RandomState> {
+    fn get_tx_dependencies(&self, t: &T, t_zero: &T0) -> HashSet<T0, RandomState> {
         if self.last_applied == *t {
             return HashSet::default();
         }
@@ -286,41 +333,43 @@ impl MutableData {
     }
 
     #[instrument(level = "trace")]
-    async fn accept_tx_ballot(&self, t_zero: &T0, ballot: Ballot) -> Option<Ballot> {
+    fn accept_tx_ballot(&self, t_zero: &T0, ballot: Ballot) -> Option<Ballot> {
         let mut write_txn = self.db.write_txn().ok()?;
-        let events_db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))
-            .ok()??;
-        let mut event = events_db.get(&write_txn, &t_zero.get_inner()).ok()??;
+        let mut event = self.events.get(&write_txn, &t_zero.get_inner()).ok()??;
 
         if event.ballot < ballot {
             event.ballot = ballot;
-            let _ = events_db.put(&mut write_txn, &t_zero.get_inner(), &event);
+            let _ = self.events.put(&mut write_txn, &t_zero.get_inner(), &event);
         }
         write_txn.commit().ok()?;
+        //self.db.force_sync().ok()?;
 
         Some(event.ballot)
     }
 
     #[instrument(level = "trace", skip(self))]
-    async fn upsert_tx(&mut self, upsert_event: UpsertEvent) -> Result<(), SyneviError> {
+    fn upsert_tx(&mut self, upsert_event: UpsertEvent) -> Result<(), SyneviError> {
         //let db = self.db.clone();
 
+        // Update the latest time
+        if self.latest_time < *upsert_event.t {
+            self.latest_time = *upsert_event.t;
+        }
+
         let mut write_txn = self.db.write_txn()?;
-        let events_db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
+        let events_db: EventDb = self.events;
+
         let event = events_db.get(&write_txn, &upsert_event.t_zero.get_inner())?;
 
         let Some(mut event) = event else {
             let mut event = Event::from(upsert_event.clone());
 
-            // Update the latest t0
-            if self.latest_t0 < event.t_zero {
-                self.latest_t0 = event.t_zero;
-            }
+            // Not an update -> Add events id mapping
+            self.id_mappings.put(
+                &mut write_txn,
+                &upsert_event.id,
+                &upsert_event.t_zero.get_inner(),
+            )?;
 
             if matches!(event.state, State::Applied) {
                 self.mappings.insert(event.t, event.t_zero);
@@ -340,11 +389,14 @@ impl MutableData {
                 }
 
                 let last_t = self.last_applied;
+
                 // Safeguard
                 assert!(last_t < event.t);
 
                 self.last_applied = event.t;
-                let hashes = event.hash_event(self.latest_hash);
+                let hashes = upsert_event
+                    .hashes
+                    .ok_or_else(|| SyneviError::MissingExecutionHash)?;
                 self.latest_hash = hashes.transaction_hash;
                 event.hashes = Some(hashes.clone());
 
@@ -356,11 +408,6 @@ impl MutableData {
             write_txn.commit()?;
             return Ok(());
         };
-
-        // Update the latest t0
-        if self.latest_t0 < event.t_zero {
-            self.latest_t0 = event.t_zero;
-        }
 
         // Do not update to a "lower" state
         if upsert_event.state < event.state {
@@ -396,11 +443,16 @@ impl MutableData {
 
             if event.state == State::Applied {
                 let last_t = self.last_applied;
-                // Safeguard
+
+                if last_t > event.t {
+                    println!("last_t: {:?}, event.t: {:?}", last_t, event.t);
+                }
                 assert!(last_t < event.t);
 
                 self.last_applied = event.t;
-                let hashes = event.hash_event(self.latest_hash);
+                let hashes = upsert_event
+                    .hashes
+                    .ok_or_else(|| SyneviError::MissingExecutionHash)?;
                 self.latest_hash = hashes.transaction_hash;
                 event.hashes = Some(hashes.clone());
             };
@@ -414,13 +466,10 @@ impl MutableData {
     }
 
     #[instrument(level = "trace")]
-    async fn get_recover_deps(&self, t_zero: &T0) -> Result<RecoverDependencies, SyneviError> {
+    fn get_recover_deps(&self, t_zero: &T0) -> Result<RecoverDependencies, SyneviError> {
         let read_txn = self.db.read_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let timestamp = db
+        let timestamp = self
+            .events
             .get(&read_txn, &t_zero.get_inner())?
             .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?
             .t;
@@ -430,7 +479,8 @@ impl MutableData {
         };
 
         for (t_dep, t_zero_dep) in self.mappings.range(self.last_applied..) {
-            let dep_event = db
+            let dep_event = self
+                .events
                 .get(&read_txn, &t_zero_dep.get_inner())?
                 .ok_or_else(|| SyneviError::DependencyNotFound(t_zero_dep.get_inner()))?;
             match dep_event.state {
@@ -450,7 +500,7 @@ impl MutableData {
                         }
                     }
                 }
-                State::Commited => {
+                State::Committed => {
                     if dep_event
                         .dependencies
                         .iter()
@@ -469,51 +519,43 @@ impl MutableData {
                 recover_deps.dependencies.insert(*t_zero_dep);
             }
         }
-        read_txn.commit()?;
         Ok(recover_deps)
     }
 
-    async fn get_event_state(&self, t_zero: &T0) -> Option<State> {
+    fn get_event_state(&self, t_zero: &T0) -> Option<State> {
         let read_txn = self.db.read_txn().ok()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))
-            .ok()??;
-        let state = db
+        let state = self
+            .events
             .get(&read_txn, &t_zero.get_inner())
             .ok()?
             .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))
             .ok()?
             .state;
-        read_txn.commit().ok()?;
         Some(state)
     }
 
-    async fn recover_event(
+    fn recover_event(
         &self,
         t_zero_recover: &T0,
         node_serial: u16,
-    ) -> Result<RecoverEvent, SyneviError> {
-        let Some(state) = self.get_event_state(t_zero_recover).await else {
-            return Err(SyneviError::EventNotFound(t_zero_recover.get_inner()));
+    ) -> Result<Option<RecoverEvent>, SyneviError> {
+        let Some(state) = self.get_event_state(t_zero_recover) else {
+            return Ok(None);
         };
         if matches!(state, synevi_types::State::Undefined) {
             return Err(SyneviError::UndefinedRecovery);
         }
 
         let mut write_txn = self.db.write_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let event = db.get(&write_txn, &t_zero_recover.get_inner())?;
+        let event = self.events.get(&write_txn, &t_zero_recover.get_inner())?;
 
         if let Some(mut event) = event {
             event.ballot = Ballot(event.ballot.next_with_node(node_serial).into_time());
-            db.put(&mut write_txn, &t_zero_recover.get_inner(), &event)?;
+            self.events
+                .put(&mut write_txn, &t_zero_recover.get_inner(), &event)?;
             write_txn.commit()?;
 
-            Ok(RecoverEvent {
+            Ok(Some(RecoverEvent {
                 id: event.id,
                 t_zero: event.t_zero,
                 t: event.t,
@@ -521,22 +563,18 @@ impl MutableData {
                 transaction: event.transaction.clone(),
                 dependencies: event.dependencies.clone(),
                 ballot: event.ballot,
-            })
+            }))
         } else {
-            Err(SyneviError::EventNotFound(t_zero_recover.get_inner()))
+            write_txn.commit()?;
+            Ok(None)
         }
     }
 
-    async fn get_event_store(&self) -> BTreeMap<T0, Event> {
+    fn get_event_store(&self) -> BTreeMap<T0, Event> {
         // TODO: Remove unwrap and change trait result
         let read_txn = self.db.read_txn().unwrap();
-        let events_db: Database<U128<BigEndian>, SerdeBincode<Event>> = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))
-            .unwrap()
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))
-            .unwrap();
-        let result = events_db
+        let result = self
+            .events
             .iter(&read_txn)
             .unwrap()
             .filter_map(|e| {
@@ -547,20 +585,18 @@ impl MutableData {
                 }
             })
             .collect::<BTreeMap<T0, Event>>();
-        read_txn.commit().unwrap();
         result
     }
 
-    async fn last_applied(&self) -> (T, T0) {
-        let t = self.last_applied.clone();
+    fn last_applied(&self) -> (T, T0) {
+        let t = self.last_applied;
         let t0 = self.mappings.get(&t).cloned().unwrap_or(T0::default());
         (t, t0)
     }
 
-    async fn get_events_after(
+    fn get_events_after(
         &self,
         last_applied: T,
-        _self_event: u128,
     ) -> Result<Receiver<Result<Event, SyneviError>>, SyneviError> {
         let (sdx, rcv) = tokio::sync::mpsc::channel(200);
         let db = self.db.clone();
@@ -569,88 +605,24 @@ impl MutableData {
             None if last_applied == T::default() => T0::default(),
             _ => return Err(SyneviError::EventNotFound(last_applied.get_inner())),
         };
+
+        let events_db = self.events;
         tokio::task::spawn_blocking(move || {
             let read_txn = db.read_txn()?;
             let range = last_applied_t0.get_inner()..;
-            let events_db: EventDb = db
-                .open_database(&read_txn, Some(EVENT_DB_NAME))?
-                .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-
             for result in events_db.range(&read_txn, &range)? {
                 let (_t0, event) = result?;
                 sdx.blocking_send(Ok(event))
                     .map_err(|e| SyneviError::SendError(e.to_string()))?;
             }
-            read_txn.commit()?;
             Ok::<(), SyneviError>(())
         });
         Ok(rcv)
     }
 
-    async fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
+    fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
         let read_txn = self.db.read_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let event = db.get(&read_txn, &t_zero.get_inner())?;
-        read_txn.commit()?;
+        let event = self.events.get(&read_txn, &t_zero.get_inner())?;
         Ok(event)
-    }
-
-    async fn get_and_update_hash(
-        &self,
-        t_zero: T0,
-        execution_hash: [u8; 32],
-    ) -> Result<Hashes, SyneviError> {
-        let t_zero = t_zero.get_inner();
-        let mut write_txn = self.db.write_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&write_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let Some(mut event) = db.get(&write_txn, &t_zero)? else {
-            return Err(SyneviError::EventNotFound(t_zero));
-        };
-        let Some(mut hashes) = event.hashes else {
-            return Err(SyneviError::MissingTransactionHash);
-        };
-        hashes.execution_hash = execution_hash;
-        event.hashes = Some(hashes.clone());
-
-        db.put(&mut write_txn, &t_zero, &event)?;
-        write_txn.commit()?;
-        Ok(hashes)
-    }
-
-    async fn last_applied_hash(&self) -> Result<(T, [u8; 32]), SyneviError> {
-        let last = self.last_applied;
-        let last_t0 = self
-            .mappings
-            .get(&last)
-            .ok_or_else(|| SyneviError::EventNotFound(last.get_inner()))?;
-        let read_txn = self.db.read_txn()?;
-        let db: EventDb = self
-            .db
-            .open_database(&read_txn, Some(EVENT_DB_NAME))?
-            .ok_or_else(|| SyneviError::DatabaseNotFound(EVENT_DB_NAME))?;
-        let event = db
-            .get(&read_txn, &last_t0.get_inner())?
-            .ok_or_else(|| SyneviError::EventNotFound(last_t0.get_inner()))?
-            .hashes
-            .ok_or_else(|| SyneviError::MissingExecutionHash)?;
-        Ok((last, event.execution_hash))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_db() {
-        // TODO
-        //let db = Database::new("../../tests/database".to_string()).unwrap();
-        //db.init(Bytes::from("key"), Bytes::from("value"))
-        //    .unwrap()
     }
 }

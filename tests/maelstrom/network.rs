@@ -9,8 +9,9 @@ use synevi::network::requests::{
     RecoverRequest, RecoverResponse,
 };
 use synevi::network::{Network, NetworkInterface, Replica};
-use synevi::{State, SyneviError, T, T0};
+use synevi::{State, SyneviError, T0};
 use synevi_network::configure_transport::GetEventResponse;
+use synevi_network::network::{MemberWithLatency, NodeStatus};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -68,6 +69,10 @@ impl Network for MaelstromNetwork {
         for (id, serial, host) in members {
             self.add_member(id, serial, host, true).await.unwrap()
         }
+    }
+
+    fn get_node_status(&self) -> Arc<NodeStatus> {
+        todo!()
     }
 
     async fn add_member(
@@ -172,32 +177,26 @@ impl Network for MaelstromNetwork {
         todo!()
     }
 
-    async fn ready_electorate(&self) -> Result<(), SyneviError> {
+    async fn ready_electorate(&self, _host: String) -> Result<(), SyneviError> {
         todo!()
     }
 
     async fn get_stream_events(
         &self,
         _last_applied: Vec<u8>,
-        _self_event: Vec<u8>,
     ) -> Result<tokio::sync::mpsc::Receiver<GetEventResponse>, SyneviError> {
         todo!()
     }
 
-    async fn broadcast_config(&self, _host: String) -> Result<(u32, Vec<u8>), SyneviError> {
+    async fn join_electorate(&self, _host: String) -> Result<u32, SyneviError> {
         todo!()
     }
 
-    async fn get_member_len(&self) -> u32 {
+    async fn get_members(&self) -> Vec<Arc<MemberWithLatency>> {
         todo!()
     }
 
-    async fn report_config(
-        &self,
-        _last_applied: T,
-        _last_applied_hash: [u8; 32],
-        _host: String,
-    ) -> Result<(), SyneviError> {
+    async fn report_config(&self, _host: String) -> Result<(), SyneviError> {
         todo!()
     }
 }
@@ -283,7 +282,7 @@ impl NetworkInterface for MaelstromNetwork {
                 self.broadcast_responses
                     .lock()
                     .await
-                    .insert((State::Commited, t0), sx);
+                    .insert((State::Committed, t0), sx);
                 for replica in members {
                     if let Err(err) = self
                         .message_sender
@@ -309,7 +308,7 @@ impl NetworkInterface for MaelstromNetwork {
                         continue;
                     };
                 }
-                (State::Commited, t0)
+                (State::Committed, t0)
             }
             BroadcastRequest::Apply(req) => {
                 let t0 = T0::try_from(req.timestamp_zero.as_slice()).unwrap();
@@ -418,6 +417,9 @@ impl NetworkInterface for MaelstromNetwork {
 
         Ok(result)
     }
+    async fn broadcast_recovery(&self, _t0: T0) -> Result<bool, SyneviError> {
+        todo!()
+    }
 }
 
 pub(crate) async fn replica_dispatch<R: Replica + 'static>(
@@ -442,7 +444,6 @@ pub(crate) async fn replica_dispatch<R: Replica + 'static>(
                         last_applied: last_applied.clone(),
                     },
                     node as u16,
-                    true,
                 )
                 .await
                 .unwrap();
@@ -470,18 +471,15 @@ pub(crate) async fn replica_dispatch<R: Replica + 'static>(
             ref last_applied,
         } => {
             let response = replica
-                .accept(
-                    AcceptRequest {
-                        id: id.clone(),
-                        ballot: ballot.clone(),
-                        event: event.clone(),
-                        timestamp_zero: t0.clone(),
-                        timestamp: t.clone(),
-                        dependencies: deps.clone(),
-                        last_applied: last_applied.clone(),
-                    },
-                    true,
-                )
+                .accept(AcceptRequest {
+                    id: id.clone(),
+                    ballot: ballot.clone(),
+                    event: event.clone(),
+                    timestamp_zero: t0.clone(),
+                    timestamp: t.clone(),
+                    dependencies: deps.clone(),
+                    last_applied: last_applied.clone(),
+                })
                 .await?;
 
             let reply = msg.reply(Body {
@@ -504,16 +502,13 @@ pub(crate) async fn replica_dispatch<R: Replica + 'static>(
             ref deps,
         } => {
             replica
-                .commit(
-                    CommitRequest {
-                        id: id.clone(),
-                        event: event.clone(),
-                        timestamp_zero: t0.clone(),
-                        timestamp: t.clone(),
-                        dependencies: deps.clone(),
-                    },
-                    true,
-                )
+                .commit(CommitRequest {
+                    id: id.clone(),
+                    event: event.clone(),
+                    timestamp_zero: t0.clone(),
+                    timestamp: t.clone(),
+                    dependencies: deps.clone(),
+                })
                 .await?;
 
             let reply = msg.reply(Body {
@@ -535,18 +530,15 @@ pub(crate) async fn replica_dispatch<R: Replica + 'static>(
         } => {
             eprintln!("Replica dispatch apply {:?}", t0);
             replica
-                .apply(
-                    ApplyRequest {
-                        id: id.clone(),
-                        event: event.clone(),
-                        timestamp_zero: t0.clone(),
-                        timestamp: t.clone(),
-                        dependencies: deps.clone(),
-                        transaction_hash: transaction_hash.clone(),
-                        execution_hash: execution_hash.clone(),
-                    },
-                    true,
-                )
+                .apply(ApplyRequest {
+                    id: id.clone(),
+                    event: event.clone(),
+                    timestamp_zero: t0.clone(),
+                    timestamp: t.clone(),
+                    dependencies: deps.clone(),
+                    transaction_hash: transaction_hash.clone(),
+                    execution_hash: execution_hash.clone(),
+                })
                 .await?;
 
             let reply = msg.reply(Body {
@@ -564,15 +556,12 @@ pub(crate) async fn replica_dispatch<R: Replica + 'static>(
             ref t0,
         } => {
             let result = replica
-                .recover(
-                    RecoverRequest {
-                        id: id.clone(),
-                        ballot: ballot.clone(),
-                        event: event.clone(),
-                        timestamp_zero: t0.clone(),
-                    },
-                    true,
-                )
+                .recover(RecoverRequest {
+                    id: id.clone(),
+                    ballot: ballot.clone(),
+                    event: event.clone(),
+                    timestamp_zero: t0.clone(),
+                })
                 .await?;
 
             let reply = msg.reply(Body {
@@ -646,7 +635,7 @@ impl MaelstromNetwork {
             MessageType::CommitOk { t0 } => {
                 let key = T0::try_from(t0.as_slice())?;
                 let lock = self.broadcast_responses.lock().await;
-                if let Some(entry) = lock.get(&(State::Commited, key)) {
+                if let Some(entry) = lock.get(&(State::Committed, key)) {
                     entry
                         .send(BroadcastResponse::Commit(CommitResponse {}))
                         .await?;

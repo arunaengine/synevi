@@ -8,6 +8,7 @@ service ConsensusTransport {
   rpc Accept(AcceptRequest) returns (AcceptResponse) {}
   rpc Apply(ApplyRequest) returns (ApplyResponse) {}
   rpc Recover(RecoverRequest) returns (RecoverResponse) {}
+  rpc TryRecovery(TryRecoveryRequest) returns (TryRecoveryResponse) {}
 }
 
 message PreAcceptRequest {
@@ -85,4 +86,12 @@ message RecoverResponse {
   bytes dependencies = 4;
   bytes timestamp = 5;
   bytes nack = 6;
+}
+
+message TryRecoveryRequest {
+    bytes timestamp_zero = 1;
+}
+
+message TryRecoveryResponse {
+    bool accepted = 1; // True if recovery can be initiated else false
 }
