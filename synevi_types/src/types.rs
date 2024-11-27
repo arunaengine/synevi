@@ -31,7 +31,7 @@ pub struct Waiter {
     pub sender: Vec<oneshot::Sender<()>>,
 }
 
-#[derive(Default, PartialEq, PartialOrd, Ord, Eq, Clone, Debug, Serialize)]
+#[derive(Default, PartialEq, PartialOrd, Ord, Eq, Clone, Debug, Serialize, Deserialize)]
 pub enum TransactionPayload<T: Transaction> {
     #[default]
     None,
@@ -39,7 +39,7 @@ pub enum TransactionPayload<T: Transaction> {
     Internal(InternalExecution),
 }
 
-#[derive(Debug, Clone, Serialize, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Eq, PartialEq, PartialOrd, Ord, Deserialize)]
 pub enum InternalExecution {
     JoinElectorate {
         id: Ulid,

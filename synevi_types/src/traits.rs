@@ -1,5 +1,5 @@
 use ahash::RandomState;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{Arc, Weak},
@@ -34,7 +34,7 @@ impl Transaction for Vec<u8> {
 
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync + 'static {
-    type Tx: Transaction + Serialize;
+    type Tx: Transaction + Serialize + DeserializeOwned;
     // Executor expects a type with interior mutability
     async fn execute(&self, id: u128, transaction: Self::Tx) -> SyneviResult<Self>;
 }

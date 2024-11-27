@@ -213,6 +213,15 @@ where
         self.event_store.get_event_by_id(id).ok().flatten()
     }
 
+    #[instrument(level = "trace", skip(self))]
+    pub fn decode_event(&self, event: Event) -> Result<Option<E::Tx>, SyneviError> {
+        let transaction = TransactionPayload::<E::Tx>::from_bytes(event.transaction)?;
+        match transaction {
+            TransactionPayload::External(tx) => Ok(Some(tx)),
+            _ => Ok(None),
+        }
+    }
+
     #[instrument(level = "trace", skip(self, transaction))]
     pub async fn transaction(self: Arc<Self>, id: u128, transaction: E::Tx) -> SyneviResult<E> {
         if !self.has_members() {
