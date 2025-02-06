@@ -43,7 +43,7 @@ impl LmdbStore {
     pub fn new(path: String, node_serial: u16) -> Result<LmdbStore, SyneviError> {
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(1024 * 1024 * 1024)
+                .map_size(10 * 1024 * 1024 * 1024)
                 .max_dbs(16)
                 .flags(EnvFlags::MAP_ASYNC | EnvFlags::WRITE_MAP)
                 .open(path)?
