@@ -257,7 +257,9 @@ impl Store for LmdbStore {
         let Some(mapping) = lock.id_mappings.get(&read_txn, &id)? else {
             return Ok(None);
         };
-        lock.events.get(&read_txn, &mapping).map_err(Into::into)
+        let result = lock.events.get(&read_txn, &mapping).map_err(Into::into);
+        read_txn.commit()?;
+        result
     }
 }
 
@@ -519,6 +521,8 @@ impl InternalData {
                 recover_deps.dependencies.insert(*t_zero_dep);
             }
         }
+
+        read_txn.commit()?;
         Ok(recover_deps)
     }
 
@@ -531,6 +535,8 @@ impl InternalData {
             .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))
             .ok()?
             .state;
+
+        read_txn.commit().ok()?;
         Some(state)
     }
 
@@ -585,6 +591,8 @@ impl InternalData {
                 }
             })
             .collect::<BTreeMap<T0, Event>>();
+
+        read_txn.commit().unwrap();
         result
     }
 
@@ -615,6 +623,8 @@ impl InternalData {
                 sdx.blocking_send(Ok(event))
                     .map_err(|e| SyneviError::SendError(e.to_string()))?;
             }
+
+            read_txn.commit()?;
             Ok::<(), SyneviError>(())
         });
         Ok(rcv)
@@ -623,6 +633,8 @@ impl InternalData {
     fn get_event(&self, t_zero: T0) -> Result<Option<Event>, SyneviError> {
         let read_txn = self.db.read_txn()?;
         let event = self.events.get(&read_txn, &t_zero.get_inner())?;
+
+        read_txn.commit()?;
         Ok(event)
     }
 }
