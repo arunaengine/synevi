@@ -242,6 +242,7 @@ where
         }
     }
 
+    #[instrument(level = "trace", skip(self, transaction))]
     pub(super) async fn internal_transaction(
         self: Arc<Self>,
         id: u128,
@@ -257,6 +258,7 @@ where
             .await
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub fn get_stats(&self) -> (u64, u64, u64) {
         (
             self.stats
@@ -377,6 +379,7 @@ where
         Ok((result, node_hashes))
     }
 
+    #[instrument(level = "trace", skip(self, transaction))]
     async fn execute(
         &self,
         id: u128,
@@ -425,11 +428,14 @@ where
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     async fn run_check_recovery(&self) {
         while !self.is_ready() {
+            trace!("Not ready for recovery");
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
+        trace!("Cloning self for recovery loop");
         let self_clonable = self
             .self_clone
             .read()
@@ -437,6 +443,7 @@ where
             .clone()
             .expect("Self clone is None");
 
+        trace!("Starting recovery loop");
         loop {
             match self.wait_handler.check_recovery() {
                 CheckResult::NoRecovery => (),
@@ -507,6 +514,7 @@ where
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self, replica))]
     async fn sync_events(
         &self,
         last_applied: T,
