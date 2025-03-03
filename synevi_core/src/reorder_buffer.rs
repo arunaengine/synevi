@@ -7,6 +7,7 @@ use std::{
 use synevi_network::network::Network;
 use synevi_types::{traits::Store, Executor, SyneviError, T, T0};
 use tokio::{sync::oneshot, time::timeout};
+use tracing::error;
 
 use crate::{node::Node, utils::into_dependency};
 
@@ -85,7 +86,6 @@ where
                     event,
                     latency,
                 })) => {
-                    //println!("Received message: {:?} latency: {}", t0, latency);
                     let now = Instant::now();
                     buffer.insert(t0, (notify, event, id));
                     if current_transaction.1 == T0::default() {
@@ -101,11 +101,8 @@ where
                         if entry.key() <= &current_transaction.1 {
                             let (t0_buffer, (notify, event, id)) = entry.remove_entry();
 
-                            let (t, deps) = self
-                                .node
-                                .event_store
-                                .pre_accept_tx(id, t0_buffer, event)
-                                .await?;
+                            let (t, deps) =
+                                self.node.event_store.pre_accept_tx(id, t0_buffer, event)?;
                             let _ = notify.send((t, into_dependency(&deps)));
                         } else {
                             break;
@@ -115,18 +112,15 @@ where
                     next_latency = latency;
                 }
                 Ok(Err(e)) => {
-                    println!("Error receiving message {e}")
+                    error!("Error receiving message {e}")
                 }
                 Err(_) => {
                     // Elapsed more than 1.2x average (TODO) latency
                     if (current_transaction.0.elapsed().as_micros() as u64) > next_latency {
                         while let Some(entry) = buffer.first_entry() {
                             let (t0_buffer, (notify, event, id)) = entry.remove_entry();
-                            let (t, deps) = self
-                                .node
-                                .event_store
-                                .pre_accept_tx(id, t0_buffer, event)
-                                .await?;
+                            let (t, deps) =
+                                self.node.event_store.pre_accept_tx(id, t0_buffer, event)?;
                             let _ = notify.send((t, into_dependency(&deps)));
                         }
                     }

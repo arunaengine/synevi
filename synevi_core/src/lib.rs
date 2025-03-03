@@ -6,16 +6,21 @@ pub mod utils;
 mod wait_handler;
 
 pub mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use synevi_network::configure_transport::GetEventResponse;
     use synevi_network::network::BroadcastResponse;
+    use synevi_network::network::MemberWithLatency;
     use synevi_network::network::NetworkInterface;
+    use synevi_network::network::NodeInfo;
+    use synevi_network::network::NodeStatus;
     use synevi_network::network::{BroadcastRequest, Network};
     use synevi_network::replica::Replica;
     use synevi_types::types::SyneviResult;
     use synevi_types::Executor;
     use synevi_types::SyneviError;
-    use synevi_types::T;
+    use synevi_types::T0;
     use tokio::sync::mpsc::Receiver;
     use tokio::sync::Mutex;
     use ulid::Ulid;
@@ -39,6 +44,9 @@ pub mod tests {
         ) -> Result<Vec<BroadcastResponse>, SyneviError> {
             self.got_requests.lock().await.push(request);
             Ok(vec![])
+        }
+        async fn broadcast_recovery(&self, _t0: T0) -> Result<bool, SyneviError> {
+            Ok(true)
         }
     }
 
@@ -70,22 +78,34 @@ pub mod tests {
         async fn get_waiting_time(&self, _node_serial: u16) -> u64 {
             0
         }
-        async fn get_member_len(&self) -> u32 {
-            0
+        async fn get_members(&self) -> Vec<Arc<MemberWithLatency>> {
+            vec![]
         }
 
-        async fn broadcast_config(&self, _host: String) -> Result<(u32, Vec<u8>), SyneviError> {
-            Ok((0, vec![0]))
+        fn get_node_status(&self) -> Arc<NodeStatus> {
+            Arc::new(NodeStatus {
+                info: NodeInfo {
+                    id: Ulid::new(),
+                    serial: 0,
+                    host: "localhost".to_string(),
+                    ready: AtomicBool::new(false),
+                },
+                members_responded: AtomicU32::new(0),
+                has_members: AtomicBool::new(false),
+            })
+        }
+
+        async fn join_electorate(&self, _host: String) -> Result<u32, SyneviError> {
+            Ok(0)
         }
         async fn get_stream_events(
             &self,
-            _self_id: Vec<u8>,
             _last_applied: Vec<u8>,
         ) -> Result<Receiver<GetEventResponse>, SyneviError> {
             let (_, rcv) = tokio::sync::mpsc::channel(1);
             Ok(rcv)
         }
-        async fn ready_electorate(&self) -> Result<(), SyneviError> {
+        async fn ready_electorate(&self, _host: String) -> Result<(), SyneviError> {
             Ok(())
         }
 
@@ -93,12 +113,7 @@ pub mod tests {
             Ok(())
         }
 
-        async fn report_config(
-            &self,
-            _last_applied: T,
-            _last_applied_hash: [u8; 32],
-            _host: String,
-        ) -> Result<(), SyneviError> {
+        async fn report_config(&self, _host: String) -> Result<(), SyneviError> {
             Ok(())
         }
     }
@@ -109,8 +124,8 @@ pub mod tests {
     impl Executor for DummyExecutor {
         type Tx = Vec<u8>;
 
-        async fn execute(&self, data: Vec<u8>) -> SyneviResult<Self> {
-            Ok(synevi_types::types::ExecutorResult::External(Ok(data)))
+        async fn execute(&self, _id: u128, data: Vec<u8>) -> SyneviResult<Self> {
+            Ok(Ok(data))
         }
     }
 }

@@ -16,3 +16,8 @@ pub mod network {
         pub use synevi_network::network::BroadcastResponse;
     }
 }
+
+pub mod storage {
+    pub use synevi_persistence::lmdb_store::LmdbStore;
+    pub use synevi_persistence::mem_store::MemStore;
+}

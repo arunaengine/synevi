@@ -66,8 +66,14 @@ pub enum SyneviError {
     NoMembersFound,
     #[error("Not ready for transactions")]
     NotReady,
-    #[error("Mismatched hashes")]
-    MismatchedHashes,
+    #[error("Mismatched execution hashes")]
+    MismatchedExecutionHashes,
+    #[error("Mismatched transaction hashes")]
+    MismatchedTransactionHashes,
+    #[error("Unrecoverable transaction")]
+    UnrecoverableTransaction,
+    #[error("Expected external transaction: {0}")]
+    InternalTransaction(String),
 }
 
 impl Serialize for SyneviError {

@@ -1,28 +1,26 @@
+use crate::coordinator::Coordinator;
 use crate::node::Node;
 use crate::utils::{from_dependency, into_dependency};
-use crate::wait_handler::WaitAction;
-use sha3::{Digest, Sha3_256};
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use synevi_network::configure_transport::{
     Config, GetEventRequest, GetEventResponse, JoinElectorateRequest, JoinElectorateResponse,
-    ReadyElectorateRequest, ReadyElectorateResponse, ReportLastAppliedRequest,
-    ReportLastAppliedResponse,
+    ReadyElectorateRequest, ReadyElectorateResponse, ReportElectorateRequest,
+    ReportElectorateResponse,
 };
 use synevi_network::consensus_transport::{
     AcceptRequest, AcceptResponse, ApplyRequest, ApplyResponse, CommitRequest, CommitResponse,
-    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse,
+    PreAcceptRequest, PreAcceptResponse, RecoverRequest, RecoverResponse, TryRecoveryRequest,
+    TryRecoveryResponse,
 };
 use synevi_network::network::Network;
-use synevi_network::reconfiguration::{BufferedMessage, Reconfiguration, Report};
+use synevi_network::reconfiguration::Reconfiguration;
 use synevi_network::replica::Replica;
 use synevi_types::traits::Store;
-use synevi_types::types::{ExecutorResult, InternalExecution, TransactionPayload, UpsertEvent};
+use synevi_types::types::{Hashes, InternalExecution, TransactionPayload, UpsertEvent};
+use synevi_types::SyneviError;
 use synevi_types::{Ballot, Executor, State, T, T0};
-use synevi_types::{SyneviError, Transaction};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::Receiver;
 use tracing::{instrument, trace};
 use ulid::Ulid;
 
@@ -33,10 +31,6 @@ where
     S: Store,
 {
     node: Arc<Node<N, E, S>>,
-    buffer: Arc<Mutex<BTreeMap<(T0, State), BufferedMessage>>>,
-    notifier: Sender<Report>,
-    ready: Arc<AtomicBool>,
-    configuring: Arc<AtomicBool>,
 }
 
 impl<N, E, S> ReplicaConfig<N, E, S>
@@ -45,50 +39,8 @@ where
     E: Executor,
     S: Store,
 {
-    pub fn new(node: Arc<Node<N, E, S>>, ready: Arc<AtomicBool>) -> (Self, Receiver<Report>) {
-        let (notifier, receiver) = channel(10);
-        (
-            Self {
-                node,
-                buffer: Arc::new(Mutex::new(BTreeMap::default())),
-                notifier,
-                ready,
-                configuring: Arc::new(AtomicBool::new(false)),
-            },
-            receiver,
-        )
-    }
-
-    pub async fn send_buffered(
-        &self,
-    ) -> Result<Receiver<Option<(T0, State, BufferedMessage)>>, SyneviError> {
-        let (sdx, rcv) = channel(100);
-        let inner = self.buffer.clone();
-        let node = self.node.clone();
-        let configure_lock = self.configuring.clone();
-        tokio::spawn(async move {
-            configure_lock.store(true, Ordering::SeqCst);
-            loop {
-                let event = inner.lock().await.pop_first();
-                if let Some(((t0, state), event)) = event {
-                    sdx.send(Some((t0, state, event))).await.map_err(|_| {
-                        SyneviError::SendError(
-                            "Channel for receiving buffered messages closed".to_string(),
-                        )
-                    })?;
-                } else {
-                    node.set_ready();
-                    sdx.send(None).await.map_err(|_| {
-                        SyneviError::SendError(
-                            "Channel for receiving buffered messages closed".to_string(),
-                        )
-                    })?;
-                    break;
-                }
-            }
-            Ok::<(), SyneviError>(())
-        });
-        Ok(rcv)
+    pub fn new(node: Arc<Node<N, E, S>>) -> Self {
+        Self { node }
     }
 }
 
@@ -99,87 +51,58 @@ where
     E: Executor + Send + Sync,
     S: Store + Send + Sync,
 {
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
-    }
     #[instrument(level = "trace", skip(self, request))]
     async fn pre_accept(
         &self,
         request: PreAcceptRequest,
         _node_serial: u16,
-        ready: bool,
     ) -> Result<PreAcceptResponse, SyneviError> {
         let t0 = T0::try_from(request.timestamp_zero.as_slice())?;
-        let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
 
-        if !ready {
+        if !self.node.is_ready() {
             return Ok(PreAcceptResponse::default());
         }
 
+        let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
+
         trace!(?request_id, "Replica: PreAccept");
-
-        // TODO(performance): Remove the lock here
-        // Creates contention on the event store
-        if let Some(ballot) = self
-            .node
-            .event_store
-            .accept_tx_ballot(&t0, Ballot::default())
-            .await
-        {
-            if ballot != Ballot::default() {
-                return Ok(PreAcceptResponse {
-                    nack: true,
-                    ..Default::default()
-                });
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ballot) = event_store.accept_tx_ballot(&t0, Ballot::default()) {
+                if ballot != Ballot::default() {
+                    return Ok(PreAcceptResponse {
+                        nack: true,
+                        ..Default::default()
+                    });
+                }
             }
-        }
 
-        // let waiting_time = self.network.get_waiting_time(node_serial).await;
+            let (t, deps) = event_store.pre_accept_tx(request_id, t0, request.event)?;
 
-        // let (sx, rx) = oneshot::channel();
-
-        let (t, deps) = self
-            .node
-            .event_store
-            .pre_accept_tx(request_id, t0, request.event)
-            .await?;
-
-        // self.reorder_buffer
-        //      .send_msg(t0, sx, request.event, waiting_time)
-        //      .await?;
-
-        // let (t, deps) = rx.await?;
-
-        Ok(PreAcceptResponse {
-            timestamp: t.into(),
-            dependencies: into_dependency(&deps),
-            nack: false,
+            Ok(PreAcceptResponse {
+                timestamp: t.into(),
+                dependencies: into_dependency(&deps),
+                nack: false,
+            })
         })
+        .await?
     }
 
     #[instrument(level = "trace", skip(self, request))]
-    async fn accept(
-        &self,
-        request: AcceptRequest,
-        ready: bool,
-    ) -> Result<AcceptResponse, SyneviError> {
+    async fn accept(&self, request: AcceptRequest) -> Result<AcceptResponse, SyneviError> {
+        if !self.node.is_ready() {
+            return Ok(AcceptResponse::default());
+        }
         let t_zero = T0::try_from(request.timestamp_zero.as_slice())?;
         let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
         let t = T::try_from(request.timestamp.as_slice())?;
         let request_ballot = Ballot::try_from(request.ballot.as_slice())?;
 
-        if !ready {
-            return Ok(AcceptResponse::default());
-        }
         trace!(?request_id, "Replica: Accept");
 
-        let dependencies = {
-            if let Some(ballot) = self
-                .node
-                .event_store
-                .accept_tx_ballot(&t_zero, request_ballot)
-                .await
-            {
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ballot) = event_store.accept_tx_ballot(&t_zero, request_ballot) {
                 if ballot != request_ballot {
                     return Ok(AcceptResponse {
                         dependencies: Vec::new(),
@@ -188,170 +111,93 @@ where
                 }
             }
 
-            self.node
-                .event_store
-                .upsert_tx(UpsertEvent {
-                    id: request_id,
-                    t_zero,
-                    t,
-                    state: State::Accepted,
-                    transaction: Some(request.event),
-                    dependencies: Some(from_dependency(request.dependencies)?),
-                    ballot: Some(request_ballot),
-                    execution_hash: None,
-                })
-                .await?;
-
-            self.node.event_store.get_tx_dependencies(&t, &t_zero).await
-        };
-        Ok(AcceptResponse {
-            dependencies: into_dependency(&dependencies),
-            nack: false,
+            event_store.upsert_tx(UpsertEvent {
+                id: request_id,
+                t_zero,
+                t,
+                state: State::Accepted,
+                transaction: Some(request.event),
+                dependencies: Some(from_dependency(request.dependencies)?),
+                ballot: Some(request_ballot),
+                hashes: None,
+            })?;
+            Ok(AcceptResponse {
+                dependencies: into_dependency(&event_store.get_tx_dependencies(&t, &t_zero)),
+                nack: false,
+            })
         })
+        .await?
     }
 
     #[instrument(level = "trace", skip(self, request))]
-    async fn commit(
-        &self,
-        request: CommitRequest,
-        ready: bool,
-    ) -> Result<CommitResponse, SyneviError> {
+    async fn commit(&self, request: CommitRequest) -> Result<CommitResponse, SyneviError> {
         let t_zero = T0::try_from(request.timestamp_zero.as_slice())?;
         let t = T::try_from(request.timestamp.as_slice())?;
         let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
-        if !self.configuring.load(Ordering::SeqCst) && !ready {
-            self.buffer
-                .lock()
-                .await
-                .insert((t_zero, State::Commited), BufferedMessage::Commit(request));
-            return Ok(CommitResponse {});
-        }
 
         trace!(?request_id, "Replica: Commit");
 
         let deps = from_dependency(request.dependencies)?;
-        let (sx, rx) = tokio::sync::oneshot::channel();
+
         self.node
-            .get_wait_handler()
-            .await?
-            .send_msg(
+            .commit(UpsertEvent {
+                id: request_id,
                 t_zero,
                 t,
-                deps,
-                request.event,
-                WaitAction::CommitBefore,
-                sx,
-                request_id,
-            )
+                state: State::Committed,
+                transaction: Some(request.event),
+                dependencies: Some(deps),
+                ballot: None,
+                hashes: None,
+            })
             .await?;
-        let _ = rx.await;
+
         Ok(CommitResponse {})
     }
 
     #[instrument(level = "trace", skip(self, request))]
-    async fn apply(
-        &self,
-        request: ApplyRequest,
-        ready: bool,
-    ) -> Result<ApplyResponse, SyneviError> {
+    async fn apply(&self, request: ApplyRequest) -> Result<ApplyResponse, SyneviError> {
         let t_zero = T0::try_from(request.timestamp_zero.as_slice())?;
         let t = T::try_from(request.timestamp.as_slice())?;
+        let deps = from_dependency(request.dependencies.clone())?;
+
         let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
-        if !self.configuring.load(Ordering::SeqCst) && !ready {
-            self.buffer
-                .lock()
-                .await
-                .insert((t_zero, State::Applied), BufferedMessage::Apply(request));
-            return Ok(ApplyResponse {});
-        }
         trace!(?request_id, "Replica: Apply");
 
-        let transaction: TransactionPayload<<E as Executor>::Tx> =
-            TransactionPayload::from_bytes(request.event)?;
-
-        let deps = from_dependency(request.dependencies)?;
-        let (sx, rx) = tokio::sync::oneshot::channel();
-
-        self.node
-            .get_wait_handler()
-            .await?
-            .send_msg(
-                t_zero,
-                t,
-                deps.clone(),
-                transaction.as_bytes(),
-                WaitAction::ApplyAfter,
-                sx,
-                request_id,
-            )
-            .await?;
-
-        rx.await
-            .map_err(|_| SyneviError::ReceiveError("Wait receiver closed".to_string()))?;
-
-        let result = match transaction {
-            TransactionPayload::None => {
-                return Err(SyneviError::TransactionNotFound);
-            }
-            TransactionPayload::External(tx) => self.node.executor.execute(tx).await,
-            TransactionPayload::Internal(request) => {
-                // TODO: Build special execution
-                let result = match &request {
-                    InternalExecution::JoinElectorate { id, serial, host } => {
-                        if id != &self.node.info.id {
-                            let res = self
-                                .node
-                                .add_member(*id, *serial, host.clone(), false)
-                                .await;
-                            let (t, hash) = self.node.event_store.last_applied_hash().await?;
-                            self.node
-                                .network
-                                .report_config(t, hash, host.clone())
-                                .await?;
-                            res
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    InternalExecution::ReadyElectorate { id, serial } => {
-                        if id != &self.node.info.id {
-                            self.node.ready_member(*id, *serial).await
-                        } else {
-                            Ok(())
-                        }
-                    }
-                };
-                match result {
-                    Ok(_) => Ok(ExecutorResult::Internal(Ok(request.clone()))),
-                    Err(err) => Ok(ExecutorResult::Internal(Err(err))),
-                }
-            }
-        };
-
-        let mut hasher = Sha3_256::new();
-        postcard::to_io(&result, &mut hasher)?;
-        let hash = hasher.finalize();
-        let hashes = self
+        let _ = self
             .node
-            .event_store
-            .get_and_update_hash(t_zero, hash.into())
-            .await?;
-        if request.transaction_hash != hashes.transaction_hash
-            || request.execution_hash != hashes.execution_hash
-        {
-            Err(SyneviError::MismatchedHashes)
-        } else {
-            Ok(ApplyResponse {})
-        }
+            .apply(
+                UpsertEvent {
+                    id: request_id,
+                    t_zero,
+                    t,
+                    state: State::Applied,
+                    transaction: Some(request.event),
+                    dependencies: Some(deps),
+                    ballot: None,
+                    hashes: None,
+                },
+                Some(Hashes {
+                    transaction_hash: request
+                        .transaction_hash
+                        .try_into()
+                        .map_err(|_e| SyneviError::MissingTransactionHash)?,
+                    execution_hash: request
+                        .execution_hash
+                        .try_into()
+                        .map_err(|_e| SyneviError::MissingExecutionHash)?,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        Ok(ApplyResponse {})
     }
 
     #[instrument(level = "trace", skip(self))]
-    async fn recover(
-        &self,
-        request: RecoverRequest,
-        ready: bool,
-    ) -> Result<RecoverResponse, SyneviError> {
-        if !ready {
+    async fn recover(&self, request: RecoverRequest) -> Result<RecoverResponse, SyneviError> {
+        if !self.node.is_ready() {
             return Ok(RecoverResponse::default());
         }
         let request_id = u128::from_be_bytes(request.id.as_slice().try_into()?);
@@ -361,57 +207,70 @@ where
         // TODO/WARNING: This was initially in one Mutex lock
         //let mut event_store = self.node.event_store.lock().await;
 
-        if let Some(state) = self.node.event_store.get_event_state(&t_zero).await {
-            // If another coordinator has started recovery with a higher ballot
-            // Return NACK with the higher ballot number
-            let request_ballot = Ballot::try_from(request.ballot.as_slice())?;
-            if let Some(ballot) = self
-                .node
-                .event_store
-                .accept_tx_ballot(&t_zero, request_ballot)
-                .await
-            {
-                if request_ballot != ballot {
-                    return Ok(RecoverResponse {
-                        nack: ballot.into(),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            if matches!(state, State::Undefined) {
-                self.node
-                    .event_store
-                    .pre_accept_tx(request_id, t_zero, request.event)
-                    .await?;
-            };
-        } else {
-            self.node
-                .event_store
-                .pre_accept_tx(request_id, t_zero, request.event)
-                .await?;
-        }
-        let recover_deps = self.node.event_store.get_recover_deps(&t_zero).await?;
-
+        let event_store = self.node.event_store.clone();
         self.node
             .stats
             .total_recovers
             .fetch_add(1, Ordering::Relaxed);
+        tokio::task::spawn_blocking(move || {
+            if let Some(state) = event_store.get_event_state(&t_zero) {
+                // If another coordinator has started recovery with a higher ballot
+                // Return NACK with the higher ballot number
+                let request_ballot = Ballot::try_from(request.ballot.as_slice())?;
+                if let Some(ballot) = event_store.accept_tx_ballot(&t_zero, request_ballot) {
+                    if request_ballot != ballot {
+                        return Ok(RecoverResponse {
+                            nack: ballot.into(),
+                            ..Default::default()
+                        });
+                    }
+                }
 
-        let local_state = self
-            .node
-            .event_store
-            .get_event_state(&t_zero)
-            .await
-            .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?;
-        Ok(RecoverResponse {
-            local_state: local_state.into(),
-            wait: into_dependency(&recover_deps.wait),
-            superseding: recover_deps.superseding,
-            dependencies: into_dependency(&recover_deps.dependencies),
-            timestamp: recover_deps.timestamp.into(),
-            nack: Ballot::default().into(),
+                if matches!(state, State::Undefined) {
+                    event_store.pre_accept_tx(request_id, t_zero, request.event)?;
+                };
+            } else {
+                event_store.pre_accept_tx(request_id, t_zero, request.event)?;
+            }
+            let recover_deps = event_store.get_recover_deps(&t_zero)?;
+
+            let local_state = event_store
+                .get_event_state(&t_zero)
+                .ok_or_else(|| SyneviError::EventNotFound(t_zero.get_inner()))?;
+            Ok(RecoverResponse {
+                local_state: local_state.into(),
+                wait: into_dependency(&recover_deps.wait),
+                superseding: recover_deps.superseding,
+                dependencies: into_dependency(&recover_deps.dependencies),
+                timestamp: recover_deps.timestamp.into(),
+                nack: Ballot::default().into(),
+            })
         })
+        .await?
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    async fn try_recover(
+        &self,
+        request: TryRecoveryRequest,
+    ) -> Result<TryRecoveryResponse, SyneviError> {
+        let t0 = T0::try_from(request.timestamp_zero.as_slice())?;
+
+        if !self.node.is_ready() {
+            if let Some(recover_event) = self
+                .node
+                .event_store
+                .recover_event(&t0, self.node.get_serial())?
+            {
+                tokio::spawn(Coordinator::recover(self.node.clone(), recover_event));
+                return Ok(TryRecoveryResponse { accepted: true });
+            }
+        }
+
+        // This ensures that this t0 will not get a fast path in the future
+        let event_store = self.node.event_store.clone();
+        tokio::task::spawn_blocking(move || event_store.inc_time_with_guard(t0)).await??;
+        Ok(TryRecoveryResponse { accepted: false })
     }
 }
 
@@ -426,13 +285,14 @@ where
         &self,
         request: JoinElectorateRequest,
     ) -> Result<JoinElectorateResponse, SyneviError> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.node.is_ready() {
             return Ok(JoinElectorateResponse::default());
         }
         let Some(Config {
             node_id,
             node_serial,
             host,
+            ..
         }) = request.config
         else {
             return Err(SyneviError::TonicStatusError(
@@ -441,7 +301,7 @@ where
         };
 
         let node = self.node.clone();
-        let majority = self.node.network.get_member_len().await;
+        let member_count = self.node.network.get_members().await.len() as u32;
         let self_event = Ulid::new();
         let _res = node
             .internal_transaction(
@@ -449,27 +309,23 @@ where
                 TransactionPayload::Internal(InternalExecution::JoinElectorate {
                     id: Ulid::from_bytes(node_id.as_slice().try_into()?),
                     serial: node_serial.try_into()?,
-                    host,
+                    new_node_host: host,
                 }),
             )
             .await?;
-        Ok(JoinElectorateResponse {
-            majority,
-            self_event: self_event.to_bytes().to_vec(),
-        })
+        Ok(JoinElectorateResponse { member_count })
     }
 
     async fn get_events(
         &self,
         request: GetEventRequest,
     ) -> Result<Receiver<Result<GetEventResponse, SyneviError>>, SyneviError> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.node.is_ready() {
             return Err(SyneviError::NotReady);
         }
         let (sdx, rcv) = tokio::sync::mpsc::channel(200);
-        let event_id = u128::from_be_bytes(request.self_event.as_slice().try_into()?);
         let last_applied = T::try_from(request.last_applied.as_slice())?;
-        let mut store_rcv = self.node.event_store.get_events_after(last_applied, event_id).await?;
+        let mut store_rcv = self.node.event_store.get_events_after(last_applied)?;
         tokio::spawn(async move {
             while let Some(Ok(event)) = store_rcv.recv().await {
                 let response = {
@@ -506,7 +362,6 @@ where
                 sdx.send(response).await.unwrap();
             }
         });
-        println!("Returning streaming receiver");
         // Stream all events to member
         Ok(rcv)
     }
@@ -516,7 +371,7 @@ where
         &self,
         request: ReadyElectorateRequest,
     ) -> Result<ReadyElectorateResponse, SyneviError> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.node.is_ready() {
             return Ok(ReadyElectorateResponse::default());
         }
         // Start ready electorate transaction with NewMemberUlid
@@ -539,39 +394,29 @@ where
     }
 
     // TODO: Move trait to Joining Node -> Rename to receive_config, Ready checks
-    async fn report_last_applied(
+    async fn report_electorate(
         &self,
-        request: ReportLastAppliedRequest,
-    ) -> Result<ReportLastAppliedResponse, SyneviError> {
-        if self.ready.load(Ordering::SeqCst) {
-            return Ok(ReportLastAppliedResponse::default());
+        request: ReportElectorateRequest,
+    ) -> Result<ReportElectorateResponse, SyneviError> {
+        if self.node.is_ready() {
+            return Ok(ReportElectorateResponse::default());
         }
-        let Some(Config {
-            node_serial,
-            node_id,
-            host,
-        }) = request.config
-        else {
-            return Err(SyneviError::InvalidConversionRequest(
-                "Invalid config".to_string(),
-            ));
-        };
-        let report = Report {
-            node_id: Ulid::from_bytes(node_id.try_into().map_err(|_| {
-                SyneviError::InvalidConversionFromBytes("Invalid Ulid conversion".to_string())
-            })?),
-            node_serial: node_serial.try_into()?,
-            node_host: host,
-            last_applied: request.last_applied.as_slice().try_into()?,
-            last_applied_hash: request.last_applied_hash.try_into().map_err(|_| {
-                SyneviError::InvalidConversionFromBytes("Invalid hash conversion".to_string())
-            })?,
-        };
-        //dbg!(&report);
-        self.notifier.send(report).await.map_err(|_| {
-            SyneviError::SendError("Sender for reporting last applied closed".to_string())
-        })?;
-        Ok(ReportLastAppliedResponse {})
+        for member in request.configs {
+            self.node
+                .add_member(
+                    Ulid::from_bytes(member.node_id.as_slice().try_into()?),
+                    member.node_serial as u16,
+                    member.host,
+                    member.ready,
+                )
+                .await?;
+        }
+        self.node
+            .network
+            .get_node_status()
+            .members_responded
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(ReportElectorateResponse {})
     }
 }
 
@@ -584,10 +429,6 @@ where
     fn clone(&self) -> Self {
         Self {
             node: self.node.clone(),
-            buffer: self.buffer.clone(),
-            notifier: self.notifier.clone(),
-            ready: self.ready.clone(),
-            configuring: self.configuring.clone(),
         }
     }
 }
