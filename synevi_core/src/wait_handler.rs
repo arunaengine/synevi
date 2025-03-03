@@ -1,4 +1,5 @@
 use ahash::RandomState;
+use tracing::instrument;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -73,6 +74,7 @@ impl<S> WaitHandler<S>
 where
     S: Store,
 {
+    #[instrument(level = "trace", skip(store))]
     pub fn new(store: Arc<S>, _serial: u16) -> Self {
         Self {
             waiters: Mutex::new(HashMap::default()),
@@ -80,6 +82,7 @@ where
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub fn get_waiter(&self, upsert_event: &UpsertEvent) -> Option<oneshot::Receiver<()>> {
         let (sdx, rcv) = oneshot::channel();
         let mut waiter_lock = self.waiters.lock().expect("Locking waiters failed");
@@ -116,6 +119,7 @@ where
         Some(rcv)
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub fn notify_commit(&self, t0_commit: &T0, t_commit: &T) {
         let mut waiter_lock = self.waiters.lock().expect("Locking waiters failed");
         waiter_lock.retain(|_, waiter| {
@@ -133,6 +137,7 @@ where
         });
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub fn notify_apply(&self, t0_commit: &T0) {
         let mut waiter_lock = self.waiters.lock().expect("Locking waiters failed");
         waiter_lock.retain(|_, waiter| {
@@ -150,6 +155,7 @@ where
         });
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub fn check_recovery(&self) -> CheckResult {
         let mut waiter_lock = self.waiters.lock().expect("Locking waiters failed");
         let len = waiter_lock.len() as u128 + 10;
