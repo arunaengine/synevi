@@ -109,8 +109,8 @@ where
         let replica = ReplicaConfig::new(node.clone());
         node.network.spawn_server(replica).await?;
 
-        let node_clone = node.clone();
-        tokio::spawn(async move { node_clone.run_check_recovery().await });
+        //let node_clone = node.clone();
+        // tokio::spawn(async move { node_clone.run_check_recovery().await });
 
         // If no config / persistence -> default
         Ok(node)
